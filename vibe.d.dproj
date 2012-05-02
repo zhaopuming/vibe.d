@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
+    <ProductVersion>10.0.0</ProductVersion>
+    <SchemaVersion>2.0</SchemaVersion>
+    <ProjectGuid>{E7750DD2-4FC4-43A8-BE30-535DC6C72C23}</ProjectGuid>
+    <UseDefaultCompiler>true</UseDefaultCompiler>
+    <IncrementalLinking>true</IncrementalLinking>
+    <BaseDirectory>.</BaseDirectory>
+    <PreferOneStepBuild>true</PreferOneStepBuild>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <OutputPath>bin\Debug</OutputPath>
+    <ObjectsDirectory>obj\Debug</ObjectsDirectory>
+    <OutputName>vibe</OutputName>
+    <Target>Executable</Target>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
+    <OutputPath>bin\Release</OutputPath>
+    <ObjectsDirectory>obj\Release</ObjectsDirectory>
+    <OutputName>vibe</OutputName>
+    <Target>Executable</Target>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Unittest|AnyCPU' ">
+    <DebugSymbols>true</DebugSymbols>
+    <OutputPath>bin\Unittest</OutputPath>
+    <ExtraCompilerArguments>-unittest </ExtraCompilerArguments>
+    <ObjectsDirectory>obj\Unittest</ObjectsDirectory>
+    <Target>Executable</Target>
+    <OutputName>vibe</OutputName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Folder Include="source\" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="source\examples\daytime.d" />
+    <Compile Include="source\examples\diet.d" />
+    <Compile Include="source\examples\download.d" />
+    <Compile Include="source\examples\echoserver.d" />
+    <Compile Include="source\examples\httprequest.d" />
+    <Compile Include="source\examples\info.d" />
+    <Compile Include="source\examples\json.d" />
+    <Compile Include="source\examples\mongodb.d" />
+    <Compile Include="source\examples\redis.d" />
+    <Compile Include="source\examples\reverse_proxy.d" />
+    <Compile Include="source\examples\sendmail.d" />
+    <Compile Include="source\examples\simplehttp.d" />
+    <Compile Include="source\examples\simple_https_server.d" />
+    <Compile Include="source\examples\static_http_server.d" />
+    <Compile Include="source\intf\openssl.d" />
+    <Compile Include="source\intf\event2\buffer.d" />
+    <Compile Include="source\intf\event2\bufferevent.d" />
+    <Compile Include="source\intf\event2\bufferevent_ssl.d" />
+    <Compile Include="source\intf\event2\config.d" />
+    <Compile Include="source\intf\event2\dns.d" />
+    <Compile Include="source\intf\event2\dns_struct.d" />
+    <Compile Include="source\intf\event2\event.d" />
+    <Compile Include="source\intf\event2\http.d" />
+    <Compile Include="source\intf\event2\listener.d" />
+    <Compile Include="source\intf\event2\rpc.d" />
+    <Compile Include="source\intf\event2\tag.d" />
+    <Compile Include="source\intf\event2\thread.d" />
+    <Compile Include="source\intf\event2\util.d" />
+    <Compile Include="source\vibe\appmain.d" />
+    <Compile Include="source\vibe\d.d" />
+    <Compile Include="source\vibe\vibe.d" />
+    <Compile Include="source\vibe\core\args.d" />
+    <Compile Include="source\vibe\core\core.d" />
+    <Compile Include="source\vibe\core\driver.d" />
+    <Compile Include="source\vibe\core\file.d" />
+    <Compile Include="source\vibe\core\log.d" />
+    <Compile Include="source\vibe\core\mutex.d" />
+    <Compile Include="source\vibe\core\process.d" />
+    <Compile Include="source\vibe\core\signal.d" />
+    <Compile Include="source\vibe\core\tcp.d" />
+    <Compile Include="source\vibe\core\drivers\libevent2.d" />
+    <Compile Include="source\vibe\core\drivers\libevent2_tcp.d" />
+    <Compile Include="source\vibe\core\drivers\threadedfile.d" />
+    <Compile Include="source\vibe\crypto\md5.d" />
+    <Compile Include="source\vibe\crypto\passwordhash.d" />
+    <Compile Include="source\vibe\crypto\sha1.d" />
+    <Compile Include="source\vibe\crypto\ssl.d" />
+    <Compile Include="source\vibe\data\bson.d" />
+    <Compile Include="source\vibe\data\json.d" />
+    <Compile Include="source\vibe\db\mongo\collection.d" />
+    <Compile Include="source\vibe\db\mongo\connection.d" />
+    <Compile Include="source\vibe\db\mongo\cursor.d" />
+    <Compile Include="source\vibe\db\mongo\db.d" />
+    <Compile Include="source\vibe\db\mongo\mongo.d" />
+    <Compile Include="source\vibe\db\redis\redis.d" />
+    <Compile Include="source\vibe\http\client.d" />
+    <Compile Include="source\vibe\http\common.d" />
+    <Compile Include="source\vibe\http\dist.d" />
+    <Compile Include="source\vibe\http\fileserver.d" />
+    <Compile Include="source\vibe\http\filterstack.d" />
+    <Compile Include="source\vibe\http\log.d" />
+    <Compile Include="source\vibe\http\proxy.d" />
+    <Compile Include="source\vibe\http\router.d" />
+    <Compile Include="source\vibe\http\server.d" />
+    <Compile Include="source\vibe\http\session.d" />
+    <Compile Include="source\vibe\http\status.d" />
+    <Compile Include="source\vibe\http\websockets.d" />
+    <Compile Include="source\vibe\http\auth\basic_auth.d" />
+    <Compile Include="source\vibe\inet\mimetypes.d" />
+    <Compile Include="source\vibe\inet\url.d" />
+    <Compile Include="source\vibe\inet\urltransfer.d" />
+    <Compile Include="source\vibe\mail\smtp.d" />
+    <Compile Include="source\vibe\stream\base64.d" />
+    <Compile Include="source\vibe\stream\stream.d" />
+    <Compile Include="source\vibe\stream\zlib.d" />
+    <Compile Include="source\vibe\templ\diet.d" />
+    <Compile Include="source\vibe\textfilter\ddoc.d" />
+    <Compile Include="source\vibe\textfilter\html.d" />
+    <Compile Include="source\vibe\textfilter\markdown.d" />
+    <Compile Include="source\vibe\textfilter\urlencode.d" />
+    <Compile Include="source\vibe\utils\string.d" />
+    <Compile Include="source\vibe\vpm\dependency.d" />
+    <Compile Include="source\vibe\vpm\installation.d" />
+    <Compile Include="source\vibe\vpm\packagesupplier.d" />
+    <Compile Include="source\vibe\vpm\registry.d" />
+    <Compile Include="source\vibe\vpm\utils.d" />
+    <Compile Include="source\vibe\vpm\vpm.d" />
+  </ItemGroup>
+</Project>
