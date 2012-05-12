@@ -13,7 +13,6 @@ import std.conv;
 import std.exception;
 import std.string;
 
-
 /**
 	Represents a URL decomposed into its components.
 */
@@ -29,6 +28,16 @@ struct Url {
 		string m_querystring;
 		string m_anchor;
 		string m_localURI;
+	}
+
+	this(string schema, string host, ushort port, Path path)
+	{
+		m_schema = schema;
+		m_host = host;
+		m_port = port;
+		m_path = path;
+		m_pathString = path.toString(true);
+		m_localURI = m_pathString;
 	}
 
 	// TODO: additional validation required (e.g. valid host and user names and port)
@@ -191,8 +200,8 @@ struct Url {
 		return path.startsWith(rhs.m_path);
 	}
 
-	Url opBinary(string OP)(Path rhs) const if( OP == "~" ) { return Url(m_schema, m_host, m_path ~ rhs); }
-	Url opBinary(string OP)(PathEntry rhs) const if( OP == "~" ) { return Url(m_schema, m_host, m_path ~ rhs); }
+	Url opBinary(string OP)(Path rhs) const if( OP == "~" ) { return Url(m_schema, m_host, m_port, m_path ~ rhs); }
+	Url opBinary(string OP)(PathEntry rhs) const if( OP == "~" ) { return Url(m_schema, m_host, m_port, m_path ~ rhs); }
 	void opOpAssign(string OP)(Path rhs) if( OP == "~" ) { m_path ~= rhs; }
 	void opOpAssign(string OP)(PathEntry rhs) if( OP == "~" ) { m_path ~= rhs; }
 
@@ -280,6 +289,22 @@ struct Path {
 		return ret.data;
 	}
 	
+	string toNativeString() const {
+		Appender!string ret;
+		
+		// for absolute unix paths start with /
+		version(Posix) { if(absolute) ret.put('/'); }
+		
+		foreach( i, f; m_nodes ){
+			version(Windows) { if( i > 0 ) ret.put('\\'); }
+			version(Posix) { if( i > 0 ) ret.put('/'); }
+			else { enforce("Unsupported OS"); }
+			ret.put(f.toString());
+		}
+		
+		return ret.data;
+	}
+	
 	bool startsWith(const Path rhs) const {
 		if( rhs.m_nodes.length > m_nodes.length ) return false;
 		foreach( i; 0 .. rhs.m_nodes.length )
@@ -298,7 +323,6 @@ struct Path {
 		ret ~= Path(m_nodes[parentPath.length-nup .. $], false);
 		return ret;
 	}
-	
 	
 	@property PathEntry head() const { enforce(m_nodes.length > 0); return m_nodes[$-1]; }
 	@property Path parentPath() const { return this[0 .. length-1]; }
