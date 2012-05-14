@@ -51,7 +51,7 @@ void parseDietFile(string template_file, ALIASES...)(OutputStream stream__)
 
 	// Generate the D source code for the diet template
 	mixin(dietParser!template_file);
-	#line 52 "diet.d"
+	#line 55 "diet.d"
 }
 
 /**
@@ -72,7 +72,7 @@ void parseDietFileCompat(string template_file, TYPES_AND_NAMES...)(OutputStream 
 
 	// Generate the D source code for the diet template
 	mixin(dietParser!template_file);
-	#line 73 "diet.d"
+	#line 76 "diet.d"
 }
 
 private @property string dietParser(string template_file)()
@@ -524,7 +524,6 @@ private struct DietParser {
 		
 		// put #id and .classes into the attribs list
 		if( id.length ) attribs ~= tuple("id", id);
-		if( classes.length ) attribs ~= tuple("class", classes);
 		
 		// parse other attributes
 		if( i < line.length && line[i] == '(' ){
@@ -533,6 +532,21 @@ private struct DietParser {
 			parseAttributes(attribstring, attribs);
 			i++;
 		}
+
+        // Add extra classes
+        bool has_classes = false;
+        if (attribs.length) {
+            foreach (idx, att; attribs) {
+                if (att[0] == "class") {
+                    if( classes.length )
+                        attribs[idx] = tuple("class", att[1]~" "~classes);
+                    has_classes = true;
+                    break;
+                }
+            }
+        }
+
+        if (!has_classes && classes.length ) attribs ~= tuple("class", classes);
 
 		// skip until the optional tag text contents begin
 		skipWhitespace(line, i);
@@ -561,15 +575,21 @@ private struct DietParser {
 				i++;
 				skipWhitespace(str, i);
 				assertp(i < str.length, "'=' must be followed by attribute string.");
-				assertp(str[i] == '\'' || str[i] == '"', "Expecting ''' or '\"' following '='.");
-				auto delimiter = str[i];
-				i++;
-				value = skipAttribString(str, i, delimiter);
-				i++;
-				skipWhitespace(str, i);
+                if (str[i] == '\'' || str[i] == '"') {
+                    auto delimiter = str[i];
+                    i++;
+                    value = skipAttribString(str, i, delimiter);
+                    i++;
+                    skipWhitespace(str, i);
+                } else if(name == "class") { //Support special-case class
+                    value = skipIdent(str, i, "_.");
+                    value = "#{join("~value~",\" \")}";
+                } else {
+                    assertp(str[i] == '\'' || str[i] == '"', "Expecting ''' or '\"' following '='.");
+                }
 			}
 			
-			assertp(i == str.length || str[i] == ',', "Unexpected text following attribute: '"~str~"'");
+			assertp(i == str.length || str[i] == ',', "Unexpected text following attribute: '"~str[0..i]~"' ('"~str[i..$]~"')");
 			if( i < str.length ){
 				i++;
 				skipWhitespace(str, i);
@@ -604,7 +624,7 @@ private struct DietParser {
 		static immutable exit_string = ["", "\"", ""];
 		size_t start = 0, i = 0;
 		while( i < str.length ){
-			if( str[i] == '#' ){
+			if( str[i] == '#' && str.length >= 2){
 				if( i > start ){
 					ret ~= enter_string[state] ~ dstringEscape(str[start .. i]);
 					state = 1;

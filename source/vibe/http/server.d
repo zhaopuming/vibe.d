@@ -369,7 +369,7 @@ final class HttpServerRequest : HttpRequest {
 		string password;
 		string querystring;
 
-		// enabled if HeetServerOption.ParseCookies is set
+		// enabled if HttpServerOption.ParseCookies is set
 		string[string] cookies;
 		
 		// enabled if HttpServerOption.ParseQueryString is set
@@ -621,56 +621,67 @@ final class HttpServerResponse : HttpResponse {
 	{
 		assert(!m_bodyWriter && !m_headerWritten, "Try to write header after body has already begun.");
 		m_headerWritten = true;
+		auto app = appender!string();
+		app.reserve(512);
+
+		void writeLine(T...)(string fmt, T args)
+		{
+			formattedWrite(app, fmt, args);
+			app.put("\r\n");
+		}
+
+		// write the status line
 		writeLine("%s %d %s", 
 			getHttpVersionString(this.httpVersion), 
 			this.statusCode,
 			this.statusPhrase.length ? this.statusPhrase : httpStatusText(this.statusCode));
-		foreach( n, v; this.headers )
-			writeLine("%s: %s", n, v);
 
-		//set cookies;
+		// write all normal headers
+		foreach( n, v; this.headers ){
+			app.put(n);
+			app.put(' ');
+			app.put(v);
+			app.put("\r\n");
+		}
+
+		// write cookies
 		if ( cookies.length > 0 ) {
 			foreach( n, cookie; this.cookies ) {
-				m_conn.write("Set-Cookie: ", false);
-				m_conn.write(n, false);
-				m_conn.write("=", false);
-				m_conn.write(urlEncode(cookie.value), false);
+				app.put("Set-Cookie: ");
+				app.put(n);
+				app.put('=');
+				filterUrlEncode(app, cookie.value);
 				if ( cookie.domain ) {
-					m_conn.write("; Domain=");
-					m_conn.write(cookie.domain, false);
+					app.put("; Domain=");
+					app.put(cookie.domain);
 				}
 				if ( cookie.path ) {
-					m_conn.write("; Path=");
-					m_conn.write(cookie.path, false);
+					app.put("; Path=");
+					app.put(cookie.path);
 				}
 				if ( cookie.expires ) {
-					m_conn.write("; Expires=");
-					m_conn.write(cookie.expires, false);
+					app.put("; Expires=");
+					app.put(cookie.expires);
 				}
 				if ( cookie.maxAge ) {
-					m_conn.write("; MaxAge=");
-					m_conn.write(to!string(cookie.maxAge), false);
+					app.put("; MaxAge=");
+					formattedWrite(app, "%s", cookie.maxAge);
 				}
 				if ( cookie.isSecure ) {
-					m_conn.write("; Secure", false);
+					app.put("; Secure");
 				}
 				if ( cookie.isHttpOnly ) {
-					m_conn.write("; HttpOnly", false);
+					app.put("; HttpOnly");
 				}
-				m_conn.write("\r\n");
+				app.put("\r\n");
 			}
 		}
-		writeLine("");
-		m_conn.flush();
+
+		// finalize reposonse header
+		app.put("\r\n");
+		m_conn.write(app.data(), true);
 	}
 
-	private void writeLine(T...)(string fmt, T args)
-	{
-		auto dst = appender!string();
-		formattedWrite(dst, fmt, args);
-		m_conn.write(dst.data(), false);
-		m_conn.write("\r\n", false);
-	}
 }
 
 
@@ -753,7 +764,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 			}
 
 		// Create the response object
-		auto res = new HttpServerResponse(conn, settings);
+		scope res = new HttpServerResponse(conn, settings);
 
 		// Error page handler
 		void errorOut(int code, string msg, string debug_msg){
@@ -764,7 +775,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 
 			res.statusCode = code;
 			if( settings && settings.errorPageHandler ){
-				auto err = new HttpServerErrorInfo;
+				scope err = new HttpServerErrorInfo;
 				err.code = code;
 				err.message = msg;
 				err.debugMessage = debug_msg;
@@ -882,6 +893,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 			if( settings.serverString.length )
 				res.headers["Server"] = settings.serverString;
 			res.headers["Date"] = toRFC822DateTimeString(Clock.currTime().toUTC());
+			if( req.persistent ) res.headers["Keep-Alive"] = "timeout=5";
 
 
 			logTrace("handle request (body %d)", req.bodyReader.leastSize);
@@ -937,13 +949,13 @@ private HttpServerRequest parseRequest(TcpConnection conn)
 	logTrace("req: %s", reqln);
 	
 	//Method
-	auto pos = reqln.indexOf(" ");
+	auto pos = reqln.indexOf(' ');
 	enforce( pos >= 0, "invalid request method" );
 
 	req.method = reqln[0 .. pos];
 	reqln = reqln[pos+1 .. $];
 	//Path
-	pos = reqln.indexOf(" ");
+	pos = reqln.indexOf(' ');
 	enforce( pos >= 0, "invalid request path" );
 
 	req.url = reqln[0 .. pos];
@@ -953,9 +965,9 @@ private HttpServerRequest parseRequest(TcpConnection conn)
 	
 	//headers
 	string ln;
-	while( (ln = cast(string)stream.readLine(MaxHttpHeaderLineLength)) != "" ){
-	logTrace("hdr: %s", ln);
-		auto colonpos = ln.indexOf(":");
+	while( (ln = cast(string)stream.readLine(MaxHttpHeaderLineLength)).length > 0 ){
+		logTrace("hdr: %s", ln);
+		auto colonpos = ln.indexOf(':');
 		if( colonpos > 0 && colonpos < ln.length - 1 ) {
 			auto name = ln[0..colonpos].strip();
 			auto value = ln[colonpos+1..$].strip();

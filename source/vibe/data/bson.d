@@ -540,6 +540,11 @@ struct BsonObjectID {
 		return false;
 	}
 
+	int opCmp(ref const BsonObjectID other) const {
+		if( m_bytes == other.m_bytes) return 0;
+		return m_bytes < other.m_bytes ? -1 : 1;
+	}
+
 	string toString() const {
 		enum hexdigits = "0123456789abcdef";
 		auto ret = new char[24];
@@ -554,6 +559,14 @@ struct BsonObjectID {
 struct BsonDate {
 	private long m_time; // milliseconds since UTC unix epoch
 
+    this(Date date) {
+        this(SysTime(date));
+    }
+
+    this(DateTime date) {
+        this(SysTime(date));
+    }
+
 	this(long time){
 		m_time = time;
 	}
@@ -562,6 +575,7 @@ struct BsonDate {
 		auto zero = unixTimeToStdTime(0);
 		m_time = (time.stdTime() - zero) / 10_000L;
 	}
+
 
 	SysTime toSysTime() const {
 		auto zero = unixTimeToStdTime(0);

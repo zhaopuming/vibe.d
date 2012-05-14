@@ -11,6 +11,8 @@ public import vibe.http.status;
 
 import vibe.core.log;
 import vibe.core.tcp;
+import vibe.utils.array;
+import vibe.utils.string;
 
 import std.algorithm;
 import std.array;
@@ -294,33 +296,57 @@ final class Cookie {
 */
 struct StrMapCI {
 	private {
-		Tuple!(string, string)[string] m_map;
+		Tuple!(string, string)[64] m_fields;
+		size_t m_fieldCount = 0;
+		Tuple!(string, string)[] m_extendedFields;
+		static char[256] s_keyBuffer;
 	}
 
 	void remove(string key){
-		m_map.remove(toLower(key));
+		auto idx = getIndex(m_fields[0 .. m_fieldCount], key);
+		if( idx >= 0 ){
+			removeFromArrayIdx(m_fields[0 .. m_fieldCount], idx);
+			m_fieldCount--;
+		} else {
+			idx = getIndex(m_extendedFields, key);
+			enforce(idx >= 0);
+			removeFromArrayIdx(m_extendedFields, idx);
+		}
 	}
 
 	string opIndex(string key){
-		auto pv = toLower(key) in m_map;
-		enforce(pv !is null, "Accessing non-existant key '"~key~"'.");
-		return (*pv)[1];
+		auto pitm = key in this;
+		enforce(pitm !is null, "Accessing non-existent key '"~key~"'.");
+		return *pitm;
 	}
-	string opIndexAssign(string val, string key){ m_map[toLower(key)] = tuple(key, val); return val; }
+	string opIndexAssign(string val, string key){
+		auto pitm = key in this;
+		if( pitm ) *pitm = val;
+		else if( m_fieldCount < m_fields.length ) m_fields[m_fieldCount++] = tuple(key, val);
+		else m_extendedFields ~= tuple(key, val);
+		return val;
+	}
 
 	inout(string)* opBinaryRight(string op)(string key) inout if(op == "in") {
-		auto p = toLower(key) in m_map;
-		if( p is null ) return null;
-		return &(*p)[1];
+		auto idx = getIndex(m_fields[0 .. m_fieldCount], key);
+		if( idx >= 0 ) return &m_fields[idx][1];
+		idx = getIndex(m_extendedFields, key);
+		if( idx >= 0 ) return &m_extendedFields[idx][1];
+		return null;
 	}
 
 	bool opBinaryRight(string op)(string key) inout if(op == "!in") {
-		return toLower(key) !in m_map;
+		return !(key in this);
 	}
 
 	int opApply(int delegate(ref string key, ref string val) del)
 	{
-		foreach( ref kv; m_map ){
+		foreach( ref kv; m_fields[0 .. m_fieldCount] ){
+			string kcopy = kv[0];
+			if( auto ret = del(kcopy, kv[1]) )
+				return ret;
+		}
+		foreach( ref kv; m_extendedFields ){
 			string kcopy = kv[0];
 			if( auto ret = del(kcopy, kv[1]) )
 				return ret;
@@ -330,7 +356,11 @@ struct StrMapCI {
 
 	int opApply(int delegate(ref string val) del)
 	{
-		foreach( ref kv; m_map ){
+		foreach( ref kv; m_fields[0 .. m_fieldCount] ){
+			if( auto ret = del(kv[1]) )
+				return ret;
+		}
+		foreach( ref kv; m_extendedFields ){
 			if( auto ret = del(kv[1]) )
 				return ret;
 		}
@@ -340,8 +370,18 @@ struct StrMapCI {
 	@property StrMapCI dup()
 	const {
 		StrMapCI ret;
-		foreach( v; m_map ) ret[v[0]] = v[1];
+		ret.m_fields[0 .. m_fieldCount] = m_fields[0 .. m_fieldCount];
+		ret.m_fieldCount = m_fieldCount;
+		ret.m_extendedFields = m_extendedFields.dup;
 		return ret;
+	}
+
+	private ptrdiff_t getIndex(in Tuple!(string, string)[] map, string key)
+	const {
+		foreach( i, ref const(Tuple!(string, string)) entry; map )
+			if( icmp2(entry[0], key) == 0 )
+				return i;
+		return -1;
 	}
 }
 
@@ -349,10 +389,11 @@ string toRFC822DateTimeString(SysTime time)
 {
 	assert(time.timezone == UTC());
 	auto ret = appender!string();
+	ret.reserve(29);
 	static immutable dayStrings = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 	static immutable monthStrings = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 	formattedWrite(ret, "%s, %02d %s %d %02d:%02d:%02d %s", dayStrings[time.dayOfWeek],
-		time.day, monthStrings[time.month], time.year, time.hour, time.minute, time.second, "GMT");
+		time.day, monthStrings[time.month-1], time.year, time.hour, time.minute, time.second, "GMT");
 	return ret.data;
 }
 
@@ -360,6 +401,7 @@ string toRFC822TimeString(SysTime time)
 {
 	assert(time.timezone == UTC());
 	auto ret = appender!string();
+	ret.reserve(12);
 	formattedWrite(ret, "%02d:%02d:%02d %s", time.hour, time.minute, time.second, "GMT");
 	return ret.data;
 }
@@ -368,10 +410,11 @@ string toRFC822DateString(SysTime time)
 {
 	assert(time.timezone == UTC());
 	auto ret = appender!string();
+	ret.reserve(16);
 	static immutable dayStrings = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 	static immutable monthStrings = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 	formattedWrite(ret, "%s, %02d %s %d", dayStrings[time.dayOfWeek],
-		time.day, monthStrings[time.month], time.year);
+		time.day, monthStrings[time.month-1], time.year);
 	return ret.data;
 }
 

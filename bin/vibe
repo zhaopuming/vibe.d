@@ -1,14 +1,17 @@
 #!/bin/sh
-export VIBEBINARY=$(readlink $(which $0))
+VIBEBINARY=$(readlink $(which $0))
 if [ ! -n "$VIBEBINARY" ]; then VIBEBINARY=$0; fi
-export VIBEPATH=$(dirname $VIBEBINARY)
-export LIBS="-L-levent -L-levent_openssl -L-lssl -L-lcrypto"
-export DFLAGS="-g -w -property"
+VIBEPATH=$(dirname $VIBEBINARY)
+LIBS="-L-levent -L-levent_openssl -L-lssl -L-lcrypto"
+DFLAGS="-g -w -property"
+START_SCRIPT=`mktemp -t vpm.start.XXXXXXXX`
+cp -p $VIBEPATH/vpm.d /tmp/vpm.d
 
-rdmd $2 $1 $DFLAGS -I$VIBEPATH/../source $LIBS -Jviews -Isource $VIBEPATH/vpm.d
+rdmd $DFLAGS -I$VIBEPATH/../source $LIBS -Jviews -Isource /tmp/vpm.d $VIBEPATH $START_SCRIPT $1 $2 $3 $4 $5 $6 $7 $8 $9
 
-if [ -f "deps.txt" ]; then
-	rdmd --force $DFLAGS -I$VIBEPATH/../source $LIBS -Jviews -Isource @deps.txt source/app.d $1 $2 $3 $4
-else
-	rdmd --force $DFLAGS -I$VIBEPATH/../source $LIBS -Jviews -Isource source/app.d $1 $2 $3 $4
+if [ $? = 0 ]
+then
+	chmod +x $START_SCRIPT
+	$START_SCRIPT
+	rm $START_SCRIPT
 fi

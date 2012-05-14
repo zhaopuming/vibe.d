@@ -50,6 +50,7 @@ package class Libevent2TcpConnection : TcpConnection {
 		bufferevent* m_baseEvent;
 		bufferevent* m_event;
 		bufferevent* m_sslEvent;
+		bool m_timeout_triggered;
 		TcpContext* m_ctx;
 		Fiber m_fiber;
 		string m_peerAddress;
@@ -107,9 +108,8 @@ package class Libevent2TcpConnection : TcpConnection {
 	{
 		checkConnected();
 		auto fd = bufferevent_getfd(m_baseEvent);
-		foreach( ref ctx; s_tcpContexts )
-			if( ctx.socketfd == fd )
-				ctx.shutdown = true;
+		m_ctx.shutdown = true;
+		bufferevent_flush(m_event, EV_WRITE, bufferevent_flush_mode.BEV_FLUSH);
 		bufferevent_flush(m_event, EV_WRITE, bufferevent_flush_mode.BEV_FINISHED);
 		bufferevent_setwatermark(m_event, EV_WRITE, 1, 0);
 		logTrace("Closing socket %d...", fd);
@@ -223,13 +223,29 @@ package class Libevent2TcpConnection : TcpConnection {
 			m_ctx.core.yieldForEvent();
 		}
 		
-		auto ret = (cast(ubyte*)ln)[0 .. nbytes].dup;
-		free(ln);
+		auto ret = (cast(ubyte*)ln)[0 .. nbytes];
 		logTrace("TCPConnection.readline return data (%d)", nbytes);
 		return ret;
 	}
 
 	ubyte[] readAll(size_t max_bytes = 0) { return readAllDefault(max_bytes); }
+
+
+	bool waitForData(int secs) {
+		if( dataAvailableForRead ) return true;
+		m_timeout_triggered = false;
+		event* timeout = event_new(m_ctx.eventLoop, -1, 0, &onTimeout, cast(void*)this);
+		timeval t;
+		t.tv_sec = secs;
+		event_add(timeout, &t);
+		while( connected ) {
+			if( dataAvailableForRead || m_timeout_triggered ) break;
+			rawYield();
+		}
+		event_del(timeout);
+		event_free(timeout);
+		return !m_timeout_triggered;
+	}
 
 	alias Stream.write write;
 
@@ -258,7 +274,7 @@ package class Libevent2TcpConnection : TcpConnection {
 	{
 		checkConnected();
 		logTrace("bufferevent_flush");
-		bufferevent_flush(m_event, EV_WRITE, bufferevent_flush_mode.BEV_FLUSH);
+		bufferevent_flush(m_event, EV_WRITE, bufferevent_flush_mode.BEV_NORMAL);
 	}
 
 	void finalize()
@@ -325,10 +341,6 @@ package struct TcpContext
 /* Private functions                                                                              */
 /**************************************************************************************************/
 
-package {
-	TcpContext*[] s_tcpContexts;
-}
-
 package extern(C)
 {
 	void onConnect(evutil_socket_t listenfd, short evtype, void *arg)
@@ -365,6 +377,7 @@ package extern(C)
 				client_ctx.shutdown = true;
 				if( client_ctx.event ){
 					logTrace("initiate lazy active disconnect (fd %d)", client_ctx.socketfd);
+					bufferevent_flush(client_ctx.event, EV_WRITE, bufferevent_flush_mode.BEV_FLUSH);
 					bufferevent_flush(client_ctx.event, EV_WRITE, bufferevent_flush_mode.BEV_FINISHED);
 					bufferevent_setwatermark(client_ctx.event, EV_WRITE, 1, 0);
 				}
@@ -403,13 +416,11 @@ package extern(C)
 			}
 			
 			auto cctx = new TcpContext(ctx.core, ctx.eventLoop, null, sockfd, buf_event, remote_addr);
-			s_tcpContexts ~= cctx;
 			bufferevent_setcb(buf_event, &onSocketRead, &onSocketWrite, &onSocketEvent, cctx);
 			timeval toread = {tv_sec: 60, tv_usec: 0};
 			bufferevent_set_timeouts(buf_event, &toread, null);
 			if( bufferevent_enable(buf_event, EV_READ|EV_WRITE) ){
 				logError("Error enabling buffered I/O event for fd %d.", sockfd);
-				s_tcpContexts.removeFromArray(cctx);
 				return;
 			}
 			
@@ -438,7 +449,6 @@ package extern(C)
 			else shutdown(ctx.socketfd, SHUT_WR);
 			bufferevent_free(buf_event);
 			ctx.event = null;
-			s_tcpContexts.removeFromArray(ctx);
 		} else if( ctx.task && ctx.task.state != Fiber.State.TERM ){
 			bufferevent_flush(buf_event, EV_WRITE, bufferevent_flush_mode.BEV_FLUSH);
 			ctx.core.resumeTask(ctx.task);
@@ -472,7 +482,6 @@ package extern(C)
 		if( free_event || (status & BEV_EVENT_ERROR) ){	
 			bufferevent_free(buf_event);
 			ctx.event = null;
-			s_tcpContexts.removeFromArray(ctx);
 		}
 
 		if( !ctx.shutdown && ctx.task && ctx.task.state != Fiber.State.TERM ){
@@ -484,6 +493,13 @@ package extern(C)
 				ctx.core.resumeTask(ctx.task);
 			}
 		}
+	}
+
+	private extern(C) void onTimeout(evutil_socket_t, short events, void* userptr)
+	{
+		auto conn = cast(Libevent2TcpConnection)userptr;
+		conn.m_timeout_triggered = true;
+		conn.m_ctx.core.resumeTask(conn.m_fiber);
 	}
 }
 
