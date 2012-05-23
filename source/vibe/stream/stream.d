@@ -28,6 +28,19 @@ interface InputStream {
 	*/
 	@property ulong leastSize();
 
+	/**
+		Queries if there is data available for immediate, non-blocking read.
+	*/
+	@property bool dataAvailableForRead();
+
+	/** Returns a temporary reference to the data that is currently buffered, typically has the size
+		leastSize() or 0 if dataAvailableForRead() returns false.
+
+		Note that any method invocation on the same stream invalidates the contents of the returned
+		buffer.
+	*/
+	const(ubyte)[] peek();
+
 	/**	Fills the preallocated array 'bytes' with data from the stream.
 
 		Throws: An exception if the operation reads past the end of the stream
@@ -41,6 +54,8 @@ interface InputStream {
 	*/
 	ubyte[] readLine(size_t max_bytes = 0, string linesep = "\r\n");
 
+	/** Reads the remaining contents of the stream into a memory buffer and returns it.
+	*/
 	ubyte[] readAll(size_t max_bytes = 0);
 
 	protected final ubyte[] readLineDefault(size_t max_bytes = 0, in string linesep = "\r\n")
@@ -102,7 +117,7 @@ interface OutputStream {
 	*/
 	final void write(in char[] bytes, bool do_flush = true)
 	{
-		write(cast(ubyte[])bytes, do_flush);
+		write(cast(const(ubyte)[])bytes, do_flush);
 	}
 
 	/** Pipes an InputStream directly into this OutputStream.
@@ -192,6 +207,10 @@ class LimitedInputStream : InputStream {
 
 	@property ulong leastSize() { return m_silentLimit ? m_input.leastSize : m_sizeLimit; }
 
+	@property bool dataAvailableForRead() { return m_input.dataAvailableForRead; }
+
+	const(ubyte)[] peek() { return m_input.peek(); }
+
 	void read(ubyte[] dst)
 	{
 		if (dst.length > m_sizeLimit) onSizeLimitReached();
@@ -245,7 +264,7 @@ class CountingOutputStream : OutputStream {
 	}
 
 	void flush() { enforce(m_out !is null, "OutputStream missing"); m_out.flush(); }
-	void finalize() { enforce(m_out !is null, "OutputStream missing"); m_out.finalize(); }
+	void finalize() { enforce(m_out !is null, "OutputStream missing"); m_out.flush(); }
 }
 
 /**
@@ -264,6 +283,8 @@ class CountingInputStream : InputStream {
 
 	@property bool empty() { enforce(m_in !is null, "InputStream missing"); return m_in.empty(); }
 	@property ulong leastSize() { enforce(m_in !is null, "InputStream missing"); return m_in.leastSize();  }
+	@property bool dataAvailableForRead() { return m_in.dataAvailableForRead; }
+	const(ubyte)[] peek() { return m_in.peek(); }
 
 	void read(ubyte[] dst)
 	{

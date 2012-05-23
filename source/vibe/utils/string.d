@@ -1,5 +1,5 @@
 /**
-	Utiltiy functions for string processing
+	Utility functions for string processing
 
 	Copyright: © 2012 Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
@@ -113,4 +113,11 @@ int icmp2(string a, string b)
 	if( i < a.length ) return 1;
 	else if( j < b.length ) return -1;
 	return 0;
+}
+
+string stripBom(string str)
+{
+	if( str.length >= 3 && str[0 .. 3] == [0xEF, 0xBB, 0xBF] )
+		return str[3 ..$];
+	return str;
 }

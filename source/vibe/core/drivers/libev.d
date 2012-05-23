@@ -80,11 +80,6 @@ class LibevDriver : EventDriver {
 		ev_break(m_loop, EVBREAK_ALL);
 	}
 	
-	void sleep(double seconds)
-	{
-		assert(false);
-	}
-	
 	FileStream openFile(string path, FileMode mode)
 	{
 		return new ThreadedFileStream(path, mode);
@@ -253,16 +248,6 @@ class LibevTcpConnection : TcpConnection {
 	@property string peerAddress() const
 	{
 		return "xxx";
-	}
-	
-	void initiateSSL(SSLContext ctx)
-	{
-		assert(false);
-	}
-	
-	void acceptSSL(SSLContext ctx)
-	{
-		assert(false);
 	}
 	
 	bool waitForData(int secs)

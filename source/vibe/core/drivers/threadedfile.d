@@ -115,6 +115,12 @@ class ThreadedFileStream : FileStream {
 		// TODO: store the owner and throw an exception if illegal calls happen
 	}
 
+	bool isOwner()
+	{
+		// TODO: really check ownership
+		return true;
+	}
+
 	void seek(ulong offset)
 	{
 		enforce(.lseek(m_fileDescriptor, offset, SEEK_SET) == offset, "Failed to seek in file.");
@@ -131,6 +137,12 @@ class ThreadedFileStream : FileStream {
 
 	@property bool empty() const { assert(this.readable); return m_ptr >= m_size; }
 	@property ulong leastSize() const { assert(this.readable); return m_size - m_ptr; }
+	@property bool dataAvailableForRead() { return true; }
+
+	const(ubyte)[] peek()
+	{
+		return null;
+	}
 
 	void read(ubyte[] dst)
 	{

@@ -72,7 +72,7 @@ class ZlibOutputStream : OutputStream {
 		auto ret = m_comp.flush(Z_FINISH);
 		if( ret.length > 0 )
 			m_out.write(cast(ubyte[])ret);
-		m_out.finalize();
+		m_out.flush();
 	}
 }
 
@@ -130,6 +130,16 @@ class ZlibInputStream : InputStream {
 		if( m_in.empty ) return 0;
 		readChunk();
 		return m_buffer.length;
+	}
+
+	@property bool dataAvailableForRead()
+	{
+		return m_buffer.length > 0 || m_in.dataAvailableForRead;
+	}
+
+	const(ubyte)[] peek()
+	{
+		return m_buffer;
 	}
 
 	void read(ubyte[] dst)

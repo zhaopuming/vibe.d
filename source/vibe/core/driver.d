@@ -33,10 +33,6 @@ interface EventDriver {
 	*/
 	void exitEventLoop();
 
-	/** Sleeps for the specified amount of time.
-	*/
-	void sleep(double seconds);
-
 	/** Opens a file on disk with the speficied file mode.
 	*/
 	FileStream openFile(string path, FileMode mode);
@@ -57,6 +53,10 @@ interface EventDriver {
 	/** Creates a new signal (a single-threaded condition variable).
 	*/
 	Signal createSignal();
+
+	/** 
+	*/
+	Timer createTimer(void delegate() callback);
 }
 
 /**
@@ -82,6 +82,9 @@ interface EventedObject {
 
 	/// Acquires the ownership of an unowned object.
 	void acquire();
+
+	/// Returns true if the calling fiber owns this object
+	bool isOwner();
 }
 
 /**
@@ -97,20 +100,11 @@ interface TcpConnection : Stream, EventedObject {
 	/// The current connection status
 	@property bool connected() const;
 
-	/// Queries if there is data available for immediate, non-blocking read.
-	@property bool dataAvailableForRead();
-
 	/// Returns the IP address of the connected peer.
 	@property string peerAddress() const;
 
-	/// Initiates an SSL connection (client).
-	void initiateSSL(SSLContext ctx);
-
-	/// Accepts an SSL connection from a client.
-	void acceptSSL(SSLContext ctx);
-
-	/// Sets a timeout  until data has to be availabe for read. Returns false on timeout.
-	bool waitForData(int secs);
+	/// Sets a timeout until data has to be availabe for read. Returns false on timeout.
+	bool waitForData(Duration timeout);
 }
 
 /**
@@ -142,13 +136,22 @@ interface FileStream : Stream, EventedObject {
 	void seek(ulong offset);
 }
 
-/**
+/** A cross-fiber signal
+
+	Note: the ownership can be shared between multiple fibers.
 */
-interface Signal {
+interface Signal : EventedObject {
 	@property int emitCount() const;
 	void emit();
 	void wait();
-	void registerSelf();
-	void unregisterSelf();
-	bool isSelfRegistered();
+}
+
+/**
+*/
+interface Timer : EventedObject {
+	@property bool pending();
+
+	void rearm(Duration dur, bool periodic = false);
+	void stop();
+	void wait();
 }

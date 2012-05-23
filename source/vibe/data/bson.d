@@ -380,7 +380,7 @@ struct Bson {
 		return Bson(null);
 	}
 
-	void opIndexAssign(Bson value, string idx){
+	void opIndexAssign(T)(T value, string idx){
 		auto newcont = appender!bdata_t();
 		checkType(Type.Object);
 		auto d = m_data[4 .. $];
@@ -400,9 +400,14 @@ struct Bson {
 			}
 		}
 
-		newcont.put(cast(ubyte)value.type);
+		static if( is(T == Bson) )
+			alias value bval;
+		else
+			auto bval = Bson(value);
+
+		newcont.put(cast(ubyte)bval.type);
 		putCString(newcont, idx);
-		newcont.put(value.data);
+		newcont.put(bval.data);
 
 		auto newdata = appender!bdata_t();
 		newdata.put(toBsonData(cast(uint)(newcont.data.length + 5)));
@@ -433,6 +438,8 @@ struct Bson {
 		Allows to access existing fields of a JSON object using dot syntax.
 	*/
 	@property inout(Bson) opDispatch(string prop)() inout { return opIndex(prop); }
+	/// ditto
+	@property void opDispatch(string prop, T)(T val) { opIndexAssign(Bson(val), prop); }
 
 	bool opEquals(ref const Bson other) const {
 		if( m_type != other.m_type ) return false;
@@ -638,6 +645,7 @@ Bson serializeToBson(T)(T value)
 	else static if( is(T == double) ) return Bson(value);
 	else static if( is(T : long) ) return Bson(cast(long)value);
 	else static if( is(T == string) ) return Bson(value);
+	else static if( is(T : const(ubyte)[]) ) return Bson(BsonBinData(BsonBinData.Type.Generic, value.idup));
 	else static if( isArray!T ){
 		auto ret = new Bson[value.length];
 		foreach( i; 0 .. value.length )
@@ -689,6 +697,7 @@ void deserializeBson(T)(ref T dst, Bson src)
 	else static if( is(T == double) ) dst = cast(double)src;
 	else static if( is(T : long) ) dst = cast(T)cast(long)src;
 	else static if( is(T == string) ) dst = cast(string)src;
+	else static if( is(T : const(ubyte)[]) ) dst = cast(T)src.get!BsonBinData.rawData.dup;
 	else static if( isArray!T ){
 		dst.length = src.length;
 		foreach( size_t i, v; cast(Bson[])src )

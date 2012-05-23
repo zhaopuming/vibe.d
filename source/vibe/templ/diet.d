@@ -60,7 +60,7 @@ void parseDietFile(string template_file, ALIASES...)(OutputStream stream__)
 	This function should only be called indiretly through HttpServerResponse.renderCompat().
 
 */
-void parseDietFileCompat(string template_file, TYPES_AND_NAMES...)(OutputStream stream__, Variant[] args__)
+void parseDietFileCompat(string template_file, TYPES_AND_NAMES...)(OutputStream stream__, Variant[] args__...)
 {
 	// some imports to make available by default inside templates
 	import vibe.http.common;
@@ -414,7 +414,8 @@ private struct DietParser {
 		// determine if we need a closing tag
 		bool has_children = true;
 		switch(tag){
-			case "br", "hr", "img", "link":
+			case "area", "base", "basefont", "br", "col", "embed", "frame",	"hr", "img", "input",
+					"link", "keygen", "meta", "param", "source", "track", "wbr":
 				has_children = false;
 				break;
 			default:
@@ -897,6 +898,10 @@ private string cttostring(T)(T x)
 
 private Line[] removeEmptyLines(string text, string file)
 {
+	// Strip UTF-8 BOM
+	if( text.length >= 3 && text[0 .. 3] == [0xEF, 0xBB, 0xBF] )
+		text = text[3 .. $];
+
 	Line[] ret;
 	int num = 1;
 	size_t idx = 0;

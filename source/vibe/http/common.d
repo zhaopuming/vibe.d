@@ -34,7 +34,7 @@ enum HttpVersion {
 */
 class HttpRequest {
 	protected {
-		TcpConnection m_conn;
+		Stream m_conn;
 	}
 	
 	public {
@@ -44,7 +44,7 @@ class HttpRequest {
 		StrMapCI headers;
 	}
 	
-	protected this(TcpConnection conn)
+	protected this(Stream conn)
 	{
 		m_conn = conn;
 	}
@@ -142,6 +142,14 @@ final class ChunkedInputStream : InputStream {
 
 	@property ulong leastSize() const { return m_bytesInCurrentChunk; }
 
+	@property bool dataAvailableForRead() { return m_in.dataAvailableForRead; }
+
+	const(ubyte)[] peek()
+	{
+		auto dt = m_in.peek();
+		return dt[0 .. min(dt.length, m_bytesInCurrentChunk)];
+	}
+
 	void read(ubyte[] dst)
 	{
 		while( dst.length > 0 ){
@@ -175,6 +183,7 @@ final class ChunkedInputStream : InputStream {
 	private void readChunk()
 	{
 		// read chunk header
+		logTrace("read next chunk header");
 		auto ln = m_in.readLine();
 		ulong sz = toImpl!ulong(cast(string)ln, 16u);
 		m_bytesInCurrentChunk = sz;
@@ -244,7 +253,7 @@ final class ChunkedOutputStream : OutputStream {
 	void finalize() {
 		flush();
 		m_out.write("0\r\n\r\n");
-		m_out.finalize();
+		m_out.flush();
 	}
 	private void writeChunkSize(long length) {
 		m_out.write(format("%x\r\n", length), false);
@@ -301,6 +310,8 @@ struct StrMapCI {
 		Tuple!(string, string)[] m_extendedFields;
 		static char[256] s_keyBuffer;
 	}
+	
+	@property size_t length() const { return m_fieldCount + m_extendedFields.length; }
 
 	void remove(string key){
 		auto idx = getIndex(m_fields[0 .. m_fieldCount], key);

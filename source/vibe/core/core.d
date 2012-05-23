@@ -107,9 +107,11 @@ void rawYield()
 /**
 	Suspends the execution of the calling task for the specified amount of time.
 */
-void sleep(double seconds)
+void sleep(Duration timeout)
 {
-	s_driver.sleep(seconds);
+	auto tm = s_driver.createTimer({});
+	tm.rearm(timeout);
+	tm.wait();
 }
 
 /**
@@ -118,6 +120,17 @@ void sleep(double seconds)
 EventDriver getEventDriver()
 {
 	return s_driver;
+}
+
+
+/**
+	Returns a new armed timer.
+*/
+Timer setTimer(Duration timeout, void delegate() callback, bool periodic = false)
+{
+	auto tm = s_driver.createTimer(callback);
+	tm.rearm(timeout, periodic);
+	return tm;
 }
 
 /**
@@ -160,7 +173,7 @@ bool isTaskLocalSet(string name)
 /**
 	A version string representing the current vibe version
 */
-enum VibeVersionString = "0.8";
+enum VibeVersionString = "0.7.3";
 
 
 /**************************************************************************************************/
@@ -268,8 +281,13 @@ shared static this()
 
 private void defaultFiberFunc()
 {
+	auto fthis = Fiber.getThis();
 	while(true){
-		auto task = s_taskFuncs[Fiber.getThis()];
+		while( fthis !in s_taskFuncs )
+			s_core.yieldForEvent();
+
+		auto task = s_taskFuncs[fthis];
+		s_taskFuncs.remove(fthis);
 		try {
 			logTrace("entering task.");
 			task();
@@ -282,8 +300,7 @@ private void defaultFiberFunc()
 		// make the fiber available for the next task
 		if( s_availableFibers.length <= s_availableFibersCount )
 			s_availableFibers.length = 2*s_availableFibers.length;
-		s_availableFibers[s_availableFibersCount++] = Fiber.getThis();
-		s_core.yieldForEvent();
+		s_availableFibers[s_availableFibersCount++] = fthis;
 	}
 }
 

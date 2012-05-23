@@ -13,11 +13,11 @@ public import vibe.stream.stream;
 
 import vibe.core.log;
 
-import intf.event2.buffer;
-import intf.event2.bufferevent;
-import intf.event2.bufferevent_ssl;
-import intf.event2.event;
-import intf.event2.util;
+import deimos.event2.buffer;
+import deimos.event2.bufferevent;
+import deimos.event2.bufferevent_ssl;
+import deimos.event2.event;
+import deimos.event2.util;
 
 import std.algorithm;
 import std.exception;
@@ -26,11 +26,14 @@ import std.string;
 
 import core.stdc.errno;
 import core.thread;
+import core.sys.posix.netinet.in_;
 import core.sys.posix.netinet.tcp;
+import core.sys.posix.sys.socket;
 
 
 private {
 	version(Windows){
+		import std.c.windows.winsock;
 		enum EWOULDBLOCK = WSAEWOULDBLOCK;
 
 		// make some neccessary parts of the socket interface public
@@ -54,6 +57,7 @@ package class Libevent2TcpConnection : TcpConnection {
 		TcpContext* m_ctx;
 		Fiber m_fiber;
 		string m_peerAddress;
+		ubyte[64] m_peekBuffer;
 	}
 	
 	this(TcpContext* ctx)
@@ -81,7 +85,7 @@ package class Libevent2TcpConnection : TcpConnection {
 	{
 		auto fd = bufferevent_getfd(m_baseEvent);
 		ubyte opt = enabled;
-		assert(fd <= int.max);
+		assert(fd <= int.max, "Socket descriptor > int.max");
 		setsockopt(cast(int)fd, IPPROTO_TCP, TCP_NODELAY, &opt, opt.sizeof);
 	}
 
@@ -101,6 +105,11 @@ package class Libevent2TcpConnection : TcpConnection {
 	void release()
 	{
 		m_ctx.task = null;
+	}
+
+	bool isOwner()
+	{
+		return m_ctx.task !is null && m_ctx.task is Fiber.getThis();
 	}
 	
 	/// Closes the connection.
@@ -141,42 +150,12 @@ package class Libevent2TcpConnection : TcpConnection {
 
 	@property string peerAddress() const { return m_peerAddress; }
 
-	/** Initiates an SSL encrypted connection.
-
-		After this call, all subsequent reads/writes will be encrypted.
-	*/
-	void initiateSSL(SSLContext ctx)
+	const(ubyte)[] peek()
 	{
-		checkConnected();
-		assert(m_event is m_baseEvent);
-		auto client_ctx = ctx.createClientCtx();
-		int options = bufferevent_options.BEV_OPT_CLOSE_ON_FREE;
-		auto state = bufferevent_ssl_state.BUFFEREVENT_SSL_CONNECTING;
-		m_sslEvent = bufferevent_openssl_filter_new(m_ctx.eventLoop, m_baseEvent, client_ctx, state, options);
-		assert(m_sslEvent !is null);
-		bufferevent_setcb(m_sslEvent, &onSocketRead, null, null, m_ctx);
-		bufferevent_enable(m_sslEvent, EV_READ|EV_WRITE);
-		m_event = m_sslEvent;
+		//auto buf = bufferevent_get_input(m_event);
+		//evbuffer_peek
+		return null;
 	}
-
-	/** Accepts an SSL intiation from the remote peer.
-
-		After this call, all subsequent reads/writes will be encrypted.
-	*/
-	void acceptSSL(SSLContext ctx)
-	{
-		checkConnected();
-		assert(m_event is m_baseEvent);
-		auto client_ctx = ctx.createClientCtx();
-		int options = bufferevent_options.BEV_OPT_CLOSE_ON_FREE;
-		auto state = bufferevent_ssl_state.BUFFEREVENT_SSL_ACCEPTING;
-		m_sslEvent = bufferevent_openssl_filter_new(m_ctx.eventLoop, m_baseEvent, client_ctx, state, options);
-		assert(m_sslEvent !is null);
-		bufferevent_setcb(m_sslEvent, &onSocketRead, null, null, m_ctx);
-		bufferevent_enable(m_sslEvent, EV_READ|EV_WRITE);
-		m_event = m_sslEvent;
-	}
-	
 
 	/** Reads as many bytes as 'dst' can hold.
 	*/
@@ -231,20 +210,26 @@ package class Libevent2TcpConnection : TcpConnection {
 	ubyte[] readAll(size_t max_bytes = 0) { return readAllDefault(max_bytes); }
 
 
-	bool waitForData(int secs) {
+	bool waitForData(Duration timeout)
+	{
 		if( dataAvailableForRead ) return true;
 		m_timeout_triggered = false;
-		event* timeout = event_new(m_ctx.eventLoop, -1, 0, &onTimeout, cast(void*)this);
+		event* evtmout = event_new(m_ctx.eventLoop, -1, 0, &onTimeout, cast(void*)this);
 		timeval t;
-		t.tv_sec = secs;
-		event_add(timeout, &t);
+		assert(timeout.total!"seconds"() <= int.max, "Timeouts must not be larger than int.max seconds!");
+		t.tv_sec = cast(int)timeout.total!"seconds"();
+		t.tv_usec = timeout.fracSec().usecs();
+		logTrace("add timeout event with %d/%d", t.tv_sec, t.tv_usec);
+		event_add(evtmout, &t);
+		logTrace("wait for data");
 		while( connected ) {
 			if( dataAvailableForRead || m_timeout_triggered ) break;
 			rawYield();
 		}
-		event_del(timeout);
-		event_free(timeout);
-		return !m_timeout_triggered;
+		logTrace(" -> timeout = %s", m_timeout_triggered);
+		event_del(evtmout);
+		event_free(evtmout);
+		return dataAvailableForRead;
 	}
 
 	alias Stream.write write;
@@ -347,11 +332,6 @@ package extern(C)
 	{
 		auto ctx = cast(TcpContext*)arg;
 
-		sockaddr_in6 remote_addr;
-		socklen_t addrlen = remote_addr.sizeof;
-		int sockfd;
-		int i;
-
 		if( !(evtype & EV_READ) ){
 			logError("Unknown event type in connect callback: 0x%hx", evtype);
 			return;
@@ -363,9 +343,10 @@ package extern(C)
 		static void delegate() client_task(TcpContext* listen_ctx, TcpContext* client_ctx)
 		{
 			return {
+				assert(client_ctx.event !is null, "Client task called without event!?");
 				client_ctx.task = Fiber.getThis();
 				auto conn = new Libevent2TcpConnection(client_ctx);
-				assert(conn.connected);
+				assert(conn.connected, "Connection closed directly after accept?!");
 				logDebug("start task (fd %d).", client_ctx.socketfd);
 				try {
 					listen_ctx.connectionCallback(conn);
@@ -385,12 +366,13 @@ package extern(C)
 			};
 		}
 
-
-		// Accept and configure incoming connections (up to 10 connections in one go)
-		for(i = 0; i < 10; i++) {
+		static bool tryAccept(evutil_socket_t listenfd, TcpContext* ctx)
+		{
 			logTrace("accept");
-			assert(listenfd < int.max);
-			sockfd = accept(cast(int)listenfd, cast(sockaddr*)&remote_addr, &addrlen);
+			assert(listenfd < int.max, "Listen socket descriptor >= int.max?!");
+			sockaddr_in6 remote_addr;
+			socklen_t addrlen = remote_addr.sizeof;
+			auto sockfd = accept(cast(int)listenfd, cast(sockaddr*)&remote_addr, &addrlen);
 			logTrace("accepted %d", sockfd);
 			if(sockfd < 0) {
 				version(Windows) auto err = evutil_socket_geterror(sockfd);
@@ -401,7 +383,7 @@ package extern(C)
 					else
 						logError("Error accepting an incoming connection: %d", err);
 				}
-				break;
+				return false;
 			}
 
 			if( evutil_make_socket_nonblocking(sockfd) ){
@@ -412,20 +394,29 @@ package extern(C)
 			auto buf_event = bufferevent_socket_new(ctx.eventLoop, sockfd, bufferevent_options.BEV_OPT_CLOSE_ON_FREE);
 			if( !buf_event ){
 				logError("Error initializing buffered I/O event for fd %d.", sockfd);
-				return;
+				return false;
 			}
 			
 			auto cctx = new TcpContext(ctx.core, ctx.eventLoop, null, sockfd, buf_event, remote_addr);
+			assert(cctx.event !is null, "event is null although it was just != null?");
 			bufferevent_setcb(buf_event, &onSocketRead, &onSocketWrite, &onSocketEvent, cctx);
 			timeval toread = {tv_sec: 60, tv_usec: 0};
 			bufferevent_set_timeouts(buf_event, &toread, null);
 			if( bufferevent_enable(buf_event, EV_READ|EV_WRITE) ){
 				logError("Error enabling buffered I/O event for fd %d.", sockfd);
-				return;
+				return false;
 			}
 			
+			assert(cctx.event !is null, "event is null just before runTask although it was just != null?");
 			runTask(client_task(ctx, cctx));
+			return true;
 		}
+
+
+		// Accept and configure incoming connections (up to 10 connections in one go)
+		foreach( i; 0 .. 10 )
+			if( !tryAccept(listenfd, ctx) )
+				break;
 		logTrace("handled incoming connections...");
 	}
 
@@ -442,7 +433,7 @@ package extern(C)
 	void onSocketWrite(bufferevent *buf_event, void *arg)
 	{
 		auto ctx = cast(TcpContext*)arg;
-		assert(ctx.event is buf_event);
+		assert(ctx.event is buf_event, "Write event on bufferevent that does not match the TcpContext");
 		logTrace("socket %d write event (%s)!", ctx.socketfd, ctx.shutdown);
 		if( ctx.shutdown ){
 			version(Windows) shutdown(ctx.socketfd, SD_SEND);
@@ -460,7 +451,7 @@ package extern(C)
 		auto ctx = cast(TcpContext*)arg;
 		ctx.status = status;
 		logDebug("Socket event on fd %d: %d", ctx.socketfd, status);
-		assert(ctx.event is buf_event);
+		assert(ctx.event is buf_event, "Status event on bufferevent that does not match the TcpContext");
 		
 		bool free_event = false;
 		
@@ -497,6 +488,7 @@ package extern(C)
 
 	private extern(C) void onTimeout(evutil_socket_t, short events, void* userptr)
 	{
+		logTrace("data wait timeout");
 		auto conn = cast(Libevent2TcpConnection)userptr;
 		conn.m_timeout_triggered = true;
 		conn.m_ctx.core.resumeTask(conn.m_fiber);

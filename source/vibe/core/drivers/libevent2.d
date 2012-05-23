@@ -12,13 +12,15 @@ import vibe.core.drivers.libevent2_tcp;
 import vibe.core.drivers.threadedfile;
 import vibe.core.log;
 
-import intf.event2.bufferevent;
-import intf.event2.dns;
-import intf.event2.event;
-import intf.event2.util;
+import deimos.event2.bufferevent;
+import deimos.event2.dns;
+import deimos.event2.event;
+import deimos.event2.util;
 
 import core.memory;
+import core.sys.posix.netinet.in_;
 import core.sys.posix.netinet.tcp;
+version(Windows) import std.c.windows.winsock;
 import core.thread;
 import std.conv;
 import std.exception;
@@ -55,6 +57,12 @@ class Libevent2Driver : EventDriver {
 		if( !m_dnsBase ) logError("Failed to initialize DNS lookup.");
 	}
 
+	/*~this()
+	{
+		evdns_base_free(m_dnsBase, 1);
+		event_base_free(m_eventLoop);
+	}*/
+
 	@property event_base* eventLoop() { return m_eventLoop; }
 	@property evdns_base* dnsEngine() { return m_dnsBase; }
 
@@ -71,11 +79,6 @@ class Libevent2Driver : EventDriver {
 	void exitEventLoop()
 	{
 		enforce(event_base_loopbreak(m_eventLoop) == 0, "Failed to exit libevent event loop.");
-	}
-
-	void sleep(double seconds)
-	{
-		assert(false);
 	}
 
 	FileStream openFile(string path, FileMode mode)
@@ -149,6 +152,11 @@ class Libevent2Driver : EventDriver {
 		return new Libevent2Signal(this);
 	}
 
+	Libevent2Timer createTimer(void delegate() callback)
+	{
+		return new Libevent2Timer(this, callback);
+	}
+
 	private int listenTcpGeneric(SOCKADDR)(int af, SOCKADDR* sock_addr, ushort port, void delegate(TcpConnection conn) connection_callback)
 	{
 		auto listenfd = socket(af, SOCK_STREAM, 0);
@@ -218,33 +226,110 @@ class Libevent2Signal : Signal {
 
 	void wait()
 	{
-		assert(!isSelfRegistered());
+		assert(!isOwner());
 		auto self = Fiber.getThis();
-		registerSelf();
+		acquire();
+		scope(exit) release();
 		auto start_count = m_emitCount;
 		while( m_emitCount == start_count )
 			m_driver.m_core.yieldForEvent();
-		unregisterSelf();
 	}
 
-	void registerSelf()
+	void acquire()
 	{
 		m_listeners[Fiber.getThis()] = true;
 	}
 
-	void unregisterSelf()
+	void release()
 	{
 		auto self = Fiber.getThis();
-		if( isSelfRegistered() )
+		if( isOwner() )
 			m_listeners.remove(self);
 	}
 
-	bool isSelfRegistered()
+	bool isOwner()
 	{
 		return (Fiber.getThis() in m_listeners) !is null;
 	}
 
 	@property int emitCount() const { return m_emitCount; }
+}
+
+class Libevent2Timer : Timer {
+	private {
+		Libevent2Driver m_driver;
+		Fiber m_owner;
+		void delegate() m_callback;
+		event* m_event;
+		bool m_pending;
+		bool m_periodic;
+		timeval m_timeout;
+	}
+
+	this(Libevent2Driver driver, void delegate() callback)
+	{
+		m_driver = driver;
+		m_callback = callback;
+	}
+
+	~this()
+	{
+		stop();
+	}
+
+	void acquire()
+	{
+		assert(m_owner is null);
+		m_owner = Fiber.getThis();
+	}
+
+	void release()
+	{
+		assert(m_owner is Fiber.getThis());
+		m_owner = null;
+	}
+
+	bool isOwner()
+	{
+		return m_owner !is null && m_owner is Fiber.getThis();
+	}
+
+	@property bool pending()
+	{
+		return m_pending;
+	}
+
+	void rearm(Duration timeout, bool periodic = false)
+	{
+		stop();
+
+		m_event = event_new(m_driver.eventLoop, -1, 0, &onTimerTimeout, cast(void*)this);
+		assert(timeout.total!"seconds"() <= int.max);
+		m_timeout.tv_sec = cast(int)timeout.total!"seconds"();
+		m_timeout.tv_usec = timeout.fracSec().usecs();
+		event_add(m_event, &m_timeout);
+		m_pending = true;
+		m_periodic = periodic;
+	}
+
+	void stop()
+	{
+		if( m_event ){
+			event_del(m_event);
+			event_free(m_event);
+			m_event = null;
+		}
+		m_pending = false;
+	}
+
+	void wait()
+	{
+		acquire();
+		scope(exit) release();
+
+		while( pending )
+			m_driver.m_core.yieldForEvent();
+	}
 }
 
 private extern(C) void onSignalTriggered(evutil_socket_t, short events, void* userptr)
@@ -257,4 +342,18 @@ private extern(C) void onSignalTriggered(evutil_socket_t, short events, void* us
 	
 	foreach( l, _; lst )
 		sig.m_driver.m_core.resumeTask(l);
+}
+
+private extern(C) void onTimerTimeout(evutil_socket_t, short events, void* userptr)
+{
+	auto tm = cast(Libevent2Timer)userptr;
+	if( !tm.m_pending ) return;
+	if( tm.m_periodic ){
+		event_del(tm.m_event);
+		event_add(tm.m_event, &tm.m_timeout);
+	} else {
+		tm.stop();
+	}
+
+	runTask(tm.m_callback);
 }

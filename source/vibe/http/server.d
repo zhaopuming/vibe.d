@@ -17,6 +17,7 @@ import vibe.data.json;
 import vibe.http.dist;
 import vibe.http.log;
 import vibe.inet.url;
+import vibe.stream.ssl;
 import vibe.stream.zlib;
 import vibe.templ.diet;
 import vibe.textfilter.urlencode;
@@ -291,8 +292,11 @@ class HttpServerSettings {
 		HttpServerOption.ParseMultiPartBody |
 		HttpServerOption.ParseCookies;
 	
-	/// Time [s] of a request after which the connection is closed with an error; not supported yet
-	uint maxRequestTime = 0; 
+	/// Time of a request after which the connection is closed with an error; not supported yet
+	Duration maxRequestTime = dur!"seconds"(0);
+
+	/// Maximum time between two request on a keep-alive connection
+	Duration keepAliveTimeout = dur!"seconds"(10);
 	
 	/// Maximum number of transferred bytes per request after which the connection is closed with
 	/// an error; not supported yet
@@ -367,7 +371,7 @@ final class HttpServerRequest : HttpRequest {
 		string path;
 		string username;
 		string password;
-		string querystring;
+		string queryString;
 
 		// enabled if HttpServerOption.ParseCookies is set
 		string[string] cookies;
@@ -423,7 +427,7 @@ final class HttpServerRequest : HttpRequest {
 */
 final class HttpServerResponse : HttpResponse {
 	private {
-		TcpConnection m_conn;
+		Stream m_conn;
 		OutputStream m_bodyWriter;
 		ChunkedOutputStream m_chunkedBodyWriter;
 		CountingOutputStream m_countingWriter;
@@ -434,7 +438,7 @@ final class HttpServerResponse : HttpResponse {
 		SysTime m_timeFinalized;
 	}
 	
-	private this(TcpConnection conn, HttpServerSettings settings)
+	private this(Stream conn, HttpServerSettings settings)
 	{
 		m_conn = conn;
 		m_countingWriter = new CountingOutputStream(conn);
@@ -533,12 +537,12 @@ final class HttpServerResponse : HttpResponse {
 	void redirect(string url, int status = HttpStatus.Found)
 	{
 		statusCode = status;
-		headers["location"] = url;
+		headers["Location"] = url;
 		headers["Content-Length"] = "14";
 		bodyWriter.write("redirecting...");
 	}
 
-	TcpConnection switchProtocol(string protocol) {
+	Stream switchProtocol(string protocol) {
 		statusCode = HttpStatus.SwitchingProtocols;
 		headers["Upgrade"] = protocol;
 		writeVoidBody();
@@ -612,6 +616,7 @@ final class HttpServerResponse : HttpResponse {
 	private void finalize() 
 	{
 		if( m_bodyWriter ) m_bodyWriter.finalize();
+		if( m_chunkedBodyWriter && m_chunkedBodyWriter !is m_bodyWriter ) m_chunkedBodyWriter.finalize();
 		m_conn.flush();
 		m_timeFinalized = Clock.currTime().toUTC();
 	}
@@ -639,6 +644,7 @@ final class HttpServerResponse : HttpResponse {
 		// write all normal headers
 		foreach( n, v; this.headers ){
 			app.put(n);
+			app.put(':');
 			app.put(' ');
 			app.put(v);
 			app.put("\r\n");
@@ -727,23 +733,24 @@ private {
 }
 
 /// private
-private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_info)
+private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen_info)
 {
-	SSLContext ssl_ctx;
+	SslContext ssl_ctx;
 	if( listen_info.sslCertFile.length || listen_info.sslKeyFile.length ){
 		logDebug("Creating SSL context...");
 		assert(listen_info.sslCertFile.length && listen_info.sslKeyFile.length);
-		ssl_ctx = new SSLContext(listen_info.sslCertFile, listen_info.sslKeyFile);
+		ssl_ctx = new SslContext(listen_info.sslCertFile, listen_info.sslKeyFile);
 		logDebug("... done");
 	}
 
+	Stream conn;
 	HttpServerRequest req;
 
 	// If this is a HTTPS server, initiate SSL
 	if( ssl_ctx ){
 		logTrace("accept ssl");
-		conn.acceptSSL(ssl_ctx);
-	}
+		conn = new SslStream(conn_, ssl_ctx, SslStreamState.Accepting);
+	} else conn = conn_;
 
 	do {
 		// Default to the first virtual host for this listener
@@ -793,7 +800,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 
 			// basic request parsing
 			req = parseRequest(conn);
-			req.peer = conn.peerAddress;
+			req.peer = conn_.peerAddress;
 			logTrace("Got request header.");
 
 			// find the matching virtual host
@@ -845,7 +852,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 			if( settings.options & HttpServerOption.ParseURL ){
 				auto url = Url.parse(req.url);
 				req.path = url.pathString;
-				req.querystring = url.querystring;
+				req.queryString = url.queryString;
 				req.username = url.username;
 				req.password = url.password;
 			}
@@ -854,7 +861,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 			if( settings.options & HttpServerOption.ParseQueryString ){
 				if( !(settings.options & HttpServerOption.ParseURL) )
 					logWarn("Query string parsing requested but URL parsing is disabled!");
-				parseFormData(req.querystring, req.query);
+				parseFormData(req.queryString, req.query);
 			}
 
 			// cookie parsing if desired
@@ -893,7 +900,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 			if( settings.serverString.length )
 				res.headers["Server"] = settings.serverString;
 			res.headers["Date"] = toRFC822DateTimeString(Clock.currTime().toUTC());
-			if( req.persistent ) res.headers["Keep-Alive"] = "timeout=5";
+			if( req.persistent ) res.headers["Keep-Alive"] = "timeout="~to!string(settings.keepAliveTimeout.total!"seconds"());
 
 
 			logTrace("handle request (body %d)", req.bodyReader.leastSize);
@@ -907,7 +914,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 				logDebug("http error thrown: %s", err.toString());
 				if( !res.headerWritten ) errorOut(err.status, err.msg, err.toString());
 				if (justifiesConnectionClose(err.status)) {
-					conn.close();
+					conn_.close();
 					break;
 				}
 			} catch (Throwable e) {
@@ -921,7 +928,7 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 			if ( !res.headerWritten ) errorOut(err.status, err.msg, err.toString());
 			else logError("HttpServerError after page has been written: %s", err.toString());
 			if (justifiesConnectionClose(err.status)) {
-				conn.close();
+				conn_.close();
 				break;
 			}
 		} catch (Throwable e) {
@@ -937,14 +944,20 @@ private void handleHttpConnection(TcpConnection conn, HTTPServerListener listen_
 		foreach( log; context.loggers )
 			log.log(req, res);
 
-	} while( req.persistent );
+		if( req.persistent && !conn_.waitForData(settings.keepAliveTimeout) ) {
+			logDebug("persistent connection timeout!");
+			break;
+		}
+
+	} while( req.persistent && conn_.connected );
 }
 
-private HttpServerRequest parseRequest(TcpConnection conn)
+private HttpServerRequest parseRequest(Stream conn)
 {
 	auto req = new HttpServerRequest;
 	auto stream = new LimitedHttpInputStream(conn, MaxHttpRequestHeaderSize);
 
+	logTrace("HTTP server reading status line");
 	auto reqln = cast(string)stream.readLine(MaxHttpHeaderLineLength);
 	logTrace("req: %s", reqln);
 	
