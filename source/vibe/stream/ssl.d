@@ -1,14 +1,15 @@
 ﻿/**
 	SSL/TLS stream implementation
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
 module vibe.stream.ssl;
 
+public import vibe.crypto.ssl;
+
 import vibe.core.log;
-import vibe.crypto.ssl;
 import vibe.stream.stream;
 
 import deimos.openssl.bio;
@@ -108,16 +109,6 @@ class SslStream : Stream {
 			//logTrace("SSL read %d/%d", ret, dst.length);
 			dst = dst[ret .. $];
 		}
-	}
-
-	ubyte[] readLine(size_t max_bytes = 0, string linesep = "\r\n")
-	{
-		return readLineDefault(max_bytes, linesep);
-	}
-
-	ubyte[] readAll(size_t max_bytes = 0)
-	{
-		return readAllDefault(max_bytes);
 	}
 
 	void write(in ubyte[] bytes_, bool do_flush = true)

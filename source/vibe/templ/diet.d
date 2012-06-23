@@ -2,11 +2,10 @@
 	Implements a compile-time Diet template parser.
 
 	Diet templates are an more or less compatible incarnation of Jade templates but with
-	embedded D source instead of JavaScript. The Jade language specification is found at
-	$(LINK https://github.com/visionmedia/jade) and provides a good overview of all the supported
-	features, as well as some that are not yet implemented for Diet templates.
+	embedded D source instead of JavaScript. The Diet syntax reference is found at
+	$(LINK http://vibed.org/templates).
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -14,6 +13,10 @@ module vibe.templ.diet;
 
 public import vibe.stream.stream;
 
+import vibe.core.file;
+import vibe.templ.utils;
+import vibe.textfilter.html;
+import vibe.textfilter.markdown;
 import vibe.utils.string;
 
 import std.array;
@@ -28,7 +31,6 @@ import std.variant;
 		htmlEscape is necessary in a few places to avoid corrupted html (e.g. in buildInterpolatedString)
 		to!string and htmlEscape should not be used in conjunction with ~ at run time. instead,
 		use filterHtmlEncode().
-		implement general :filters instead of the two special cases :javascript and :css
 */
 
 
@@ -51,7 +53,7 @@ void parseDietFile(string template_file, ALIASES...)(OutputStream stream__)
 
 	// Generate the D source code for the diet template
 	mixin(dietParser!template_file);
-	#line 55 "diet.d"
+	#line 57 "diet.d"
 }
 
 /**
@@ -72,7 +74,33 @@ void parseDietFileCompat(string template_file, TYPES_AND_NAMES...)(OutputStream 
 
 	// Generate the D source code for the diet template
 	mixin(dietParser!template_file);
-	#line 76 "diet.d"
+	#line 78 "diet.d"
+}
+
+/**
+	Registers a new text filter for use in Diet templates.
+
+	The filter will be available using :filtername inside of the template. The following filters are
+	predefined: css, javascript, markdown
+*/
+void registerDietTextFilter(string name, string function(string, int indent) filter)
+{
+	s_filters[name] = filter;
+}
+
+/**************************************************************************************************/
+/* private functions                                                                              */
+/**************************************************************************************************/
+
+private {
+	string function(string, int indent)[string] s_filters;
+}
+
+static this()
+{
+	registerDietTextFilter("css", &filterCSS);
+	registerDietTextFilter("javascript", &filterJavaScript);
+	registerDietTextFilter("markdown", &filterMarkdown);
 }
 
 private @property string dietParser(string template_file)()
@@ -98,26 +126,6 @@ private @property string dietParser(string template_file)()
 	parser.indentStyle = indent_style;
 	parser.blocks = blocks;
 	return parser.buildWriter();
-}
-
-private template localAliases(int i, ALIASES...)
-{
-	static if( i < ALIASES.length ){
-		enum string localAliases = "alias ALIASES["~cttostring(i)~"] "~__traits(identifier, ALIASES[i])~";\n"
-			~localAliases!(i+1, ALIASES);
-	} else {
-		enum string localAliases = "";
-	}
-}
-
-private template localAliasesCompat(int i, TYPES_AND_NAMES...)
-{
-	static if( i+1 < TYPES_AND_NAMES.length ){
-		enum string localAliasesCompat = "auto "~TYPES_AND_NAMES[i+1]~" = *args__["~cttostring(i/2)~"].peek!(TYPES_AND_NAMES["~cttostring(i)~"])();\n"
-			~localAliasesCompat!(i+2, TYPES_AND_NAMES);
-	} else {
-		enum string localAliasesCompat = "";
-	}
 }
 
 private string extractExtensionName(in Line[] text)
@@ -295,11 +303,29 @@ private struct DietParser {
 			assertp(node_stack.length >= level, cttostring(node_stack.length) ~ ">=" ~ cttostring(level));
 			assertp(next_indent_level <= level+1, "Indentations may not skip child levels.");
 
-			if( ln[0] == '-' ) ret ~= buildCodeNodeWriter(node_stack, ln[1 .. ln.length], level, in_string);
-			else if( ln[0] == '|' ) ret ~= buildTextNodeWriter(node_stack, ln[1 .. ln.length], level, in_string);
-			else {
+			if( ln[0] == '-' ){ // embedded D code
+				ret ~= buildCodeNodeWriter(node_stack, ln[1 .. ln.length], level, in_string);
+			} else if( ln[0] == '|' ){ // plain text node
+				ret ~= buildTextNodeWriter(node_stack, ln[1 .. ln.length], level, in_string);
+			} else if( ln[0] == ':' ){ // filter node (filtered raw text)
+				// find all child lines
+				size_t next_tag = curline+1;
+				while( next_tag < lines.length &&
+					indentLevel(lines[next_tag].text, indentStyle) > level-base_level )
+				{
+					next_tag++;
+				}
+
+				ret ~= buildFilterNodeWriter(node_stack, ln, level, base_level, in_string,
+						lines[curline+1 .. next_tag]);
+
+				// skip to the next tag
+				//node_stack ~= "-";
+				curline = next_tag-1;
+				next_indent_level = (curline+1 < lines.length ? indentLevel(lines[curline+1].text, indentStyle) : 0) + base_level;
+			} else {
 				size_t j = 0;
-				auto tag = isAlpha(ln[0]) || ln[0] == '/' || ln[0] == ':' ? skipIdent(ln, j, "/:-_") : "div";
+				auto tag = isAlpha(ln[0]) || ln[0] == '/' ? skipIdent(ln, j, "/:-_") : "div";
 				switch(tag){
 					default:
 						ret ~= buildHtmlNodeWriter(node_stack, tag, ln[j .. $], level, in_string, next_indent_level > level);
@@ -325,8 +351,6 @@ private struct DietParser {
 						ret ~= buildSpecialTag!(node_stack)("!--[if "~ln[j .. $]~"]", level, in_string);
 						node_stack ~= "<![endif]-->";
 						break;
-					case ":css":
-					case ":javascript":
 					case "script":
 					case "style":
 						// pass all child lines to buildRawTag and continue with the next sibling
@@ -339,6 +363,7 @@ private struct DietParser {
 						ret ~= buildRawNodeWriter(node_stack, tag, ln[j .. $], level, base_level,
 							in_string, lines[curline+1 .. next_tag]);
 						curline = next_tag-1;
+						next_indent_level = (curline+1 < lines.length ? indentLevel(lines[curline+1].text, indentStyle) : 0) + base_level;
 						break;
 					case "//":
 					case "//-":
@@ -462,21 +487,6 @@ private struct DietParser {
 		Tuple!(string, string)[] attribs;
 		parseHtmlTag(tagline, i, attribs);
 
-		// special case some jade "filters" - they are not yet implemented as filters
-		switch(tag){
-			default: assert(false);
-			case "script": break;
-			case "style": break;
-			case ":javascript":
-				tag = "script";
-				attribs ~= tuple("type", "text/javascript");
-				break;
-			case ":css":
-				tag = "style";
-				attribs ~= tuple("type", "text/css");
-				break;
-		}
-
 		// write the tag
 		string ret = buildHtmlTag(node_stack, tag, level, in_string, attribs);
 
@@ -499,6 +509,54 @@ private struct DietParser {
 		if( tag == "script" ) ret ~= indent_string~"//]]>\\n";
 		else ret ~= indent_string~"-->\\n";
 		ret ~= indent_string[0 .. $-2] ~ "</" ~ tag ~ ">";
+		return ret;
+	}
+
+	string buildFilterNodeWriter(ref string[] node_stack, string tagline, int level,
+			int base_level, ref bool in_string, in Line[] lines)
+	{
+		string ret;
+
+		// find all filters
+		size_t j = 0;
+		string[] filters;
+		do {
+			j++;
+			filters ~= skipIdent(tagline, j);
+			skipWhitespace(tagline, j);
+		} while( j < tagline.length && tagline[j] == ':' );
+
+		// assemble child lines to one string
+		string content = tagline[j .. $];
+		foreach( cln; lines ){
+			if( content.length ) content ~= '\n';
+			content ~= cln.text[(level-base_level+1)*indentStyle.length .. $];
+		}
+
+		// determine the current HTML indent level
+		int indent = 0;
+		foreach( i; 0 .. level ) if( node_stack[i][0] != '-' ) indent++;
+
+		// compile-time filter whats possible
+		filter_loop:
+		foreach_reverse( f; filters ){
+			switch(f){
+				default: break filter_loop;
+				case "css": content = filterCSS(content, indent); break;
+				case "javascript": content = filterJavaScript(content, indent); break;
+				case "markdown": content = filterMarkdown(content, indent); break;
+			}
+			filters.length = filters.length-1;
+		}
+
+		// the rest of the filtering will happen at run time
+		ret ~= endString(in_string) ~ StreamVariableName~".write(";
+		string filter_expr;
+		foreach_reverse( flt; filters ) ret ~= "s_filters[\""~dstringEscape(flt)~"\"](";
+		ret ~= "\"" ~ dstringEscape(content) ~ "\"";
+		foreach( i; 0 .. filters.length ) ret ~= ", "~cttostring(indent)~")";
+		ret ~= ");\n";
+
 		return ret;
 	}
 
@@ -783,51 +841,6 @@ private string dstringEscape(string str)
 	return ret;
 }
 
-private string htmlAttribEscape(dchar ch)
-{
-	switch(ch){
-		default: return htmlEscape(ch);
-		case '\"': return "&quot;";
-	}
-}
-private string htmlAttribEscape(string str)
-{
-	string ret;
-	foreach( dchar ch; str ) ret ~= htmlAttribEscape(ch);
-	return ret;
-}
-
-private string htmlEscape(dchar ch)
-{
-	switch(ch){
-		default: return "&#" ~ cttostring(ch) ~ ";";
-		case 'a': .. case 'z': goto case;
-		case 'A': .. case 'Z': goto case;
-		case '0': .. case '9': goto case;
-		case ' ', '\t', '-', '_', '.', ':', ',', ';',
-		     '#', '+', '*', '?', '=', '(', ')', '/', '!':
-			return to!string(ch);
-		case '\"': return "&quot;";
-		case '<': return "&lt;";
-		case '>': return "&gt;";
-		case '&': return "&amp;";
-	}
-}
-private string htmlEscape(string str)
-{
-	if( __ctfe ){
-		string ret;
-		foreach( dchar ch; str ) ret ~= htmlEscape(ch);
-		return ret;
-	} else {
-		auto ret = appender!string();
-		foreach( dchar ch; str ) ret.put(htmlEscape(ch));
-		return ret.data;
-	}
-}
-
-
-
 private string unindent(string str, string indent)
 {
 	size_t lvl = indentLevel(str, indent);
@@ -848,23 +861,6 @@ private int indentLevel(in Line[] ln, string indent)
 	return ln.length == 0 ? 0 : indentLevel(ln[0].text, indent);
 }
 
-/*private bool isAlphanum(char ch)
-{
-	switch( ch ){
-		default: return false;
-		case 'a': .. case 'z'+1: break;
-		case 'A': .. case 'Z'+1: break;
-		case '0': .. case '9'+1: break;
-		case '_': break;
-	}
-	return true;
-}*/
-
-/*private bool isWhitespace(char ch)
-{
-	return ch == ' ';
-}*/
-
 private string _toString(T)(T v)
 {
 	static if( is(T == string) ) return v;
@@ -881,26 +877,9 @@ private string ctstrip(string s)
 	return strt < end ? s[strt .. end] : null;
 }
 
-private string cttostring(T)(T x)
-{
-	static if( is(T == string) ) return x;
-	else static if( is(T : long) || is(T : ulong) ){
-		string s;
-		do {
-			s = cast(char)('0' + (x%10)) ~ s;
-			x /= 10;
-		} while (x>0);
-		return s;
-	} else {
-		static assert(false, "Invalid type for cttostring: "~T.stringof);
-	}
-}
-
 private Line[] removeEmptyLines(string text, string file)
 {
-	// Strip UTF-8 BOM
-	if( text.length >= 3 && text[0 .. 3] == [0xEF, 0xBB, 0xBF] )
-		text = text[3 .. $];
+	text = stripUTF8Bom(text);
 
 	Line[] ret;
 	int num = 1;
@@ -930,4 +909,45 @@ private Line[] removeEmptyLines(string text, string file)
 		num++;
 	}
 	return ret;
+}
+
+/**************************************************************************************************/
+/* Compile time filters                                                                           */
+/**************************************************************************************************/
+
+string filterCSS(string text, int indent)
+{
+	auto lines = splitLines(text);
+
+	string indent_string = "\n";
+	while( indent-- > 0 ) indent_string ~= '\t';
+
+	string ret = indent_string~"<style type=\"text/css\"><!--";
+	indent_string = indent_string ~ '\t';
+	foreach( ln; lines ) ret ~= indent_string ~ ln;
+	indent_string = indent_string[0 .. $-1];
+	ret ~= indent_string ~ "--></style>";
+
+	return ret;
+}
+
+
+string filterJavaScript(string text, int indent)
+{
+	auto lines = splitLines(text);
+
+	string indent_string = "\n";
+	while( indent-- >= 0 ) indent_string ~= '\t';
+
+	string ret = indent_string[0 .. $-1]~"<script type=\"text/javascript\">";
+	ret ~= indent_string~"//<![CDATA[";
+	foreach( ln; lines ) ret ~= indent_string ~ ln;
+	ret ~= indent_string ~ "//]]>"~indent_string[0 .. $-1]~"</script>";
+
+	return ret;
+}
+
+string filterMarkdown(string text, int indent)
+{
+	return vibe.textfilter.markdown.filterMarkdown(text);
 }

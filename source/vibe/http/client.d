@@ -1,7 +1,7 @@
 /**
 	A simple HTTP/1.1 client implementation.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig, Jan Krüger
 */
@@ -10,10 +10,13 @@ module vibe.http.client;
 public import vibe.core.tcp;
 public import vibe.http.common;
 
+import vibe.core.connectionpool;
 import vibe.core.core;
 import vibe.core.log;
 import vibe.data.json;
+import vibe.inet.rfc5322;
 import vibe.inet.url;
+import vibe.stream.counting;
 import vibe.stream.ssl;
 import vibe.stream.zlib;
 
@@ -44,14 +47,41 @@ HttpClientResponse requestHttp(Url url, void delegate(HttpClientRequest req) req
 	enforce(url.schema == "http" || url.schema == "https", "Url schema must be http(s).");
 	enforce(url.host.length > 0, "Url must contain a host name.");
 
-	auto cli = new HttpClient;
 	bool ssl = url.schema == "https";
-	cli.connect(url.host, url.port ? url.port : ssl ? 443 : 80, ssl);
-	return cli.request((req){
+	auto cli = connectHttp(url.host, url.port, ssl);
+	auto res = cli.request((req){
 			req.url = url.path.toString();
 			req.headers["Host"] = url.host;
 			if( requester ) requester(req);
 		});
+	res.bodyReader = new LockedInputStream!HttpClient(cli, res.bodyReader);
+	return res;
+}
+
+/**
+	Returns a HttpClient proxy that is connected to the specified host.
+
+	Internally, a connection pool is used to reuse already existing connections.
+*/
+auto connectHttp(string host, ushort port = 0, bool ssl = false)
+{
+	static ConnectionPool!HttpClient[string] s_connections;
+	if( port == 0 ) port = ssl ? 443 : 80;
+	string cstring = host ~ ':' ~ to!string(port) ~ ':' ~ to!string(ssl);
+
+	ConnectionPool!HttpClient pool;
+	if( auto pcp = cstring in s_connections )
+		pool = *pcp;
+	else {
+		pool = new ConnectionPool!HttpClient({
+				auto ret = new HttpClient;
+				ret.connect(host, port, ssl);
+				return ret;
+			});
+		s_connections[cstring] = pool;
+	}
+
+	return pool.lockConnection();
 }
 
 
@@ -59,7 +89,7 @@ HttpClientResponse requestHttp(Url url, void delegate(HttpClientRequest req) req
 /* Public types                                                                                   */
 /**************************************************************************************************/
 
-class HttpClient {
+class HttpClient : EventedObject {
 	enum MaxHttpHeaderLineLength = 4096;
 
 	private {
@@ -77,8 +107,13 @@ class HttpClient {
 		m_sink = new NullOutputStream;
 	}
 
+	void acquire() { if( m_conn ) m_conn.acquire(); }
+	void release() { if( m_conn ) m_conn.release(); }
+	bool isOwner() { return m_conn ? m_conn.isOwner() : true; }
+
 	void connect(string server, ushort port = 80, bool ssl = false)
 	{
+		assert(port != 0);
 		m_conn = null;
 		m_server = server;
 		m_port = port;
@@ -135,17 +170,9 @@ class HttpClient {
 		}
 		
 		// read headers until an empty line is hit
-		while(true){
-			string ln = cast(string)m_stream.readLine(MaxHttpHeaderLineLength);
-			logTrace("hdr: %s", ln);
-			if( ln.length == 0 ) break;
-			auto idx = ln.indexOf(":");
-			auto name = ln[0 .. idx];
-			ln = stripLeft(ln[idx+1 .. $]);
-			if( auto ph = name in res.headers ) *ph ~= ", " ~ ln;
-			else res.headers[name] = ln;
-		}
+		parseRfc5322Header(m_stream, res.headers, MaxHttpHeaderLineLength);
 
+		// prepare body the reader
 		if( req.method == "HEAD" ){
 			res.bodyReader = new LimitedInputStream(null, 0);
 		} else {

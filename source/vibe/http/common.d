@@ -1,7 +1,7 @@
 /**
 	Common classes for HTTP clients and servers.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig, Jan Krüger
 */
@@ -171,14 +171,6 @@ final class ChunkedInputStream : InputStream {
 
 		}
 	}
-
-	ubyte[] readLine(size_t max_bytes, string line_sep = "\r\n")
-	{
-		return readLineDefault(max_bytes, line_sep);
-	}
-
-	ubyte[] readAll(size_t max_bytes = 0) { return readAllDefault(max_bytes); }
-
 
 	private void readChunk()
 	{

@@ -1,7 +1,7 @@
 ﻿/**
 	Contains the SSLContext class used for SSL based network connections.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -86,11 +86,12 @@ enum SSLVersion {
 
 version(SSL)
 {
-	static this()
+	shared static this()
 	{
 		logDebug("Initializing OpenSSL...");
 		SSL_load_error_strings();
 		SSL_library_init();
+		// TODO: call thread safety functions!
 		/* We MUST have entropy, or else there's no point to crypto. */
 		auto ret = RAND_poll();
 		assert(ret);

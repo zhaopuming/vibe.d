@@ -1,7 +1,7 @@
 /**
 	URL parsing routines.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -277,6 +277,25 @@ struct Path {
 	}
 	
 	@property bool absolute() const { return m_absolute; }
+
+	void normalize()
+	{
+		immutable(PathEntry)[] newnodes;
+		foreach( n; m_nodes ){
+			switch(n.toString()){
+				default:
+					newnodes ~= n;
+					break;
+				case ".": break;
+				case "..":
+					enforce(!m_absolute || newnodes.length > 0, "Path goes below root node.");
+					if( newnodes.length > 0 && newnodes[$-1] != ".." ) newnodes = newnodes[0 .. $-1];
+					else newnodes ~= n;
+					break;
+			}
+		}
+		m_nodes = newnodes;
+	}
 	
 	string toString(bool in_url = false) const {
 		if( m_nodes.empty ) return absolute ? "/" : "";
@@ -423,7 +442,9 @@ struct PathEntry {
 	Path opBinary(string OP)(PathEntry rhs) const if( OP == "~" ) { return Path(cast(immutable)[this, rhs], false); }
 	
 	bool opEquals(ref const PathEntry rhs) const { return m_name == rhs.m_name; }
+	bool opEquals(string rhs) const { return m_name == rhs; }
 	int opCmp(ref const PathEntry rhs) const { return m_name.cmp(rhs.m_name); }
+	int opCmp(string rhs) const { return m_name.cmp(rhs); }
 }
 
 private bool isValidFilename(string str)

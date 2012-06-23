@@ -1,14 +1,15 @@
 /**
 	Contains interfaces and enums for evented I/O drivers.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
 module vibe.core.driver;
 
-public import vibe.crypto.ssl;
 public import vibe.stream.stream;
+
+import vibe.inet.url;
 
 import core.thread;
 
@@ -33,6 +34,10 @@ interface EventDriver {
 	*/
 	void exitEventLoop();
 
+	/** Passes the given task to a worker thread and executes it
+	*/
+	void runWorkerTask(void delegate() f);
+
 	/** Opens a file on disk with the speficied file mode.
 	*/
 	FileStream openFile(string path, FileMode mode);
@@ -54,7 +59,9 @@ interface EventDriver {
 	*/
 	Signal createSignal();
 
-	/** 
+	/** Creates a new timer.
+
+		The timer can be started by calling rearm() with a timeout.
 	*/
 	Timer createTimer(void delegate() callback);
 }
@@ -120,8 +127,8 @@ enum FileMode {
 	Accesses the contents of a file as a stream.
 */
 interface FileStream : Stream, EventedObject {
-	/// Closes the file handle.
-	void close();
+	/// The path of the file.
+	@property Path path() const;
 
 	/// Returns the total size of the file.
 	@property ulong size() const;
@@ -131,6 +138,9 @@ interface FileStream : Stream, EventedObject {
 
 	/// Determines if this stream is writable.
 	@property bool writable() const;
+
+	/// Closes the file handle.
+	void close();
 
 	/// Seeks to a specific position in the file if supported by the stream.
 	void seek(ulong offset);

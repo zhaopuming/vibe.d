@@ -1,7 +1,7 @@
 /**
 	Utility functions for string processing
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -9,6 +9,7 @@ module vibe.utils.string;
 
 public import std.string;
 
+import std.algorithm;
 import std.array;
 import std.uni;
 import std.utf;
@@ -39,6 +40,17 @@ string sanitizeUTF8(in ubyte[] str)
 }
 
 /**
+	Strips the byte order mark of an UTF8 encoded string.
+	This is useful when the string is coming from a file.
+*/
+string stripUTF8Bom(string str)
+{
+	if( str.length >= 3 && str[0 .. 3] == [0xEF, 0xBB, 0xBF] )
+		return str[3 ..$];
+	return str;
+}
+
+/**
 	Joins an array of strings using 'linesep' as the line separator (\n by default).
 */
 string joinLines(string[] strs, string linesep = "\n")
@@ -57,7 +69,7 @@ string joinLines(string[] strs, string linesep = "\n")
 bool allOf(string str, string chars)
 {
 	foreach( ch; str )
-		if( chars.indexOf(ch) < 0 )
+		if( chars.countUntil(ch) < 0 )
 			return false;
 	return true;
 }
@@ -68,7 +80,7 @@ bool allOf(string str, string chars)
 bool anyOf(string str, string chars)
 {
 	foreach( ch; str )
-		if( chars.indexOf(ch) >= 0 )
+		if( chars.countUntil(ch) >= 0 )
 			return true;
 	return false;
 }
@@ -113,11 +125,4 @@ int icmp2(string a, string b)
 	if( i < a.length ) return 1;
 	else if( j < b.length ) return -1;
 	return 0;
-}
-
-string stripBom(string str)
-{
-	if( str.length >= 3 && str[0 .. 3] == [0xEF, 0xBB, 0xBF] )
-		return str[3 ..$];
-	return str;
 }

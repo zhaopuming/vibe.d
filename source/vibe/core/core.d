@@ -1,7 +1,7 @@
 ﻿/**
 	This module contains the core functionality of the vibe framework.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -61,7 +61,7 @@ int start()
 	continue to run until vibeYield() or any of the I/O or wait functions is
 	called.
 */
-void runTask(void delegate() task)
+Fiber runTask(void delegate() task)
 {
 	// if there is no fiber available, create one.
 	if( s_availableFibersCount == 0 ){
@@ -78,6 +78,20 @@ void runTask(void delegate() task)
 	s_tasks ~= f;
 	s_core.resumeTask(f);
 	logDebug("run task out");
+	return f;
+}
+
+/**
+	Runs a new asynchronous task in a worker thread.
+
+	NOTE: the interface of this function will change in the future to ensure that no unprotected
+	data is passed between threads!
+
+	NOTE: You should not use this function yet and it currently behaves just like runTask.
+*/
+void runWorkerTask(void delegate() task)
+{
+	s_driver.runWorkerTask(task);
 }
 
 /**
@@ -173,7 +187,7 @@ bool isTaskLocalSet(string name)
 /**
 	A version string representing the current vibe version
 */
-enum VibeVersionString = "0.7.3";
+enum VibeVersionString = "0.7.5";
 
 
 /**************************************************************************************************/
@@ -238,7 +252,7 @@ private {
 	Fiber[] s_tasks;
 	Exception[Fiber] s_exceptions;
 	bool s_eventLoopRunning = false;
-	VibeDriverCore s_core;
+	__gshared VibeDriverCore s_core;
 	EventDriver s_driver;
 	Variant[string][Fiber] s_taskLocalStorage;
 	//Variant[string] s_currentTaskStorage;
@@ -277,6 +291,13 @@ shared static this()
 		siginfo.sa_handler = &onBrokenPipe;
 		sigaction(SIGPIPE, &siginfo, null);
 	}
+}
+
+shared static ~this()
+{
+	// TODO: use destroy instead
+	delete s_driver;
+	delete s_core;
 }
 
 private void defaultFiberFunc()

@@ -1,7 +1,7 @@
 /**
 	A HTTP 1.1/1.0 server implementation.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig, Jan Krüger
 */
@@ -15,13 +15,17 @@ import vibe.core.core;
 import vibe.core.log;
 import vibe.data.json;
 import vibe.http.dist;
+import vibe.http.form;
 import vibe.http.log;
+import vibe.inet.rfc5322;
 import vibe.inet.url;
+import vibe.stream.counting;
 import vibe.stream.ssl;
 import vibe.stream.zlib;
 import vibe.templ.diet;
 import vibe.textfilter.urlencode;
 import vibe.utils.string;
+import vibe.core.file;
 
 import std.algorithm : countUntil, min;
 import std.array;
@@ -226,6 +230,8 @@ class HttpServerErrorInfo {
 	string message;
 	/// Extended error message with debug information such as a stack trace
 	string debugMessage;
+	/// The error exception, if any
+	Throwable exception;
 }
 
 /// Delegate type used for user defined error page generator callbacks.
@@ -386,6 +392,7 @@ final class HttpServerRequest : HttpRequest {
 		ubyte[] data;
 		Json json; // only set if HttpServerOption.ParseJsonBoxy is set
 		string[string] form; // only set if HttpServerOption.ParseFormBody is set
+		FilePart[string] files; // only set if HttpServerOption.ParseFormBody is set
 
 		/*
 			body types:
@@ -720,21 +727,57 @@ private class LimitedHttpInputStream : LimitedInputStream {
 	}
 }
 
+private class TimeoutHttpInputStream : InputStream {
+	private {
+		SysTime m_timeref;
+		Duration m_timeleft;
+		InputStream m_in;
+	}
+
+	this(InputStream stream, Duration timeleft) {
+		enforce(timeleft > dur!"seconds"(0), "Timeout required");
+		m_in = stream;
+		m_timeleft = timeleft;
+		m_timeref = Clock.currTime();
+	}
+
+	@property bool empty() { enforce(m_in !is null, "InputStream missing"); return m_in.empty(); }
+	@property ulong leastSize() { enforce(m_in !is null, "InputStream missing"); return m_in.leastSize();  }
+	@property bool dataAvailableForRead() {  enforce(m_in !is null, "InputStream missing"); return m_in.dataAvailableForRead; }
+	const(ubyte)[] peek() { return m_in.peek(); }
+
+	void read(ubyte[] dst)
+	{
+		enforce(m_in !is null, "InputStream missing");
+		checkTimeout();
+		m_in.read(dst);
+	}
+
+	private void checkTimeout() {
+		SysTime curr = Clock.currTime();
+		auto diff = curr - m_timeref;
+		if( diff > m_timeleft ) throw new HttpServerError(HttpStatus.RequestTimeout);
+		m_timeleft -= diff;
+		m_timeref = curr;
+	}
+}
+
 /**************************************************************************************************/
 /* Private functions                                                                              */
 /**************************************************************************************************/
 
 private {
-	__gshared string s_distHost;
-	__gshared ushort s_distPort = 11000;
-	bool s_listenersStarted = false;
-	HTTPServerContext[] g_contexts;
-	HTTPServerListener[] g_listeners;
+	shared string s_distHost;
+	shared ushort s_distPort = 11000;
+	shared bool s_listenersStarted = false;
+	__gshared HTTPServerContext[] g_contexts;
+	__gshared HTTPServerListener[] g_listeners;
 }
 
 /// private
 private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen_info)
 {
+	NullOutputStream nullWriter = new NullOutputStream();
 	SslContext ssl_ctx;
 	if( listen_info.sslCertFile.length || listen_info.sslKeyFile.length ){
 		logDebug("Creating SSL context...");
@@ -774,7 +817,7 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 		scope res = new HttpServerResponse(conn, settings);
 
 		// Error page handler
-		void errorOut(int code, string msg, string debug_msg){
+		void errorOut(int code, string msg, string debug_msg, Throwable ex){
 			assert(!res.headerWritten);
 
 			// stack traces sometimes contain random bytes - make sure they are replaced
@@ -786,6 +829,7 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 				err.code = code;
 				err.message = msg;
 				err.debugMessage = debug_msg;
+				err.exception = ex;
 				settings.errorPageHandler(req, res, err);
 			} else {
 				res.contentType = "text/plain";
@@ -794,14 +838,28 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 			assert(res.headerWritten);
 		}
 
+		bool parsed = false;
+
 		// parse the request
 		try {
 			logTrace("reading request..");
 
+			InputStream reqReader;
+			if( settings.maxRequestTime == dur!"seconds"(0) ) reqReader = conn;
+			else reqReader = new TimeoutHttpInputStream(conn, settings.maxRequestTime);
+
 			// basic request parsing
-			req = parseRequest(conn);
+			req = parseRequest(reqReader);
 			req.peer = conn_.peerAddress;
 			logTrace("Got request header.");
+
+			//handle Expect-Header
+			if( auto pv = "Expect" in req.headers) {
+				if( *pv == "100-continue" ) {
+					logTrace("sending 100 continue");
+					conn.write("HTTP/1.1 100 Continue\r\n");
+				}
+			}
 
 			// find the matching virtual host
 			foreach( ctx; g_contexts )
@@ -834,17 +892,17 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 				auto contentLength = parse!ulong(v); // DMDBUG: to! thinks there is a H in the string
 				enforce(v.length == 0, "Invalid content-length");
 				enforce(settings.maxRequestSize <= 0 || contentLength <= settings.maxRequestSize, "Request size too big");
-				req.bodyReader = new LimitedHttpInputStream(conn, contentLength);
+				req.bodyReader = new LimitedHttpInputStream(reqReader, contentLength);
 			} else {
 				if( auto pt = "Transfer-Encoding" in req.headers ){
 					enforce(*pt == "chunked");
-					req.bodyReader = new LimitedHttpInputStream(new ChunkedInputStream(conn), settings.maxRequestSize, true);
+					req.bodyReader = new LimitedHttpInputStream(new ChunkedInputStream(reqReader), settings.maxRequestSize, true);
 				} else {
 					auto pc = "Connection" in req.headers;
 					if( pc && *pc == "close" )
-						req.bodyReader = new LimitedHttpInputStream(conn, settings.maxRequestSize, true);
+						req.bodyReader = new LimitedHttpInputStream(reqReader, settings.maxRequestSize, true);
 					else
-						req.bodyReader = new LimitedHttpInputStream(conn, 0);
+						req.bodyReader = new LimitedHttpInputStream(reqReader, 0);
 				}
 			}
 
@@ -861,7 +919,7 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 			if( settings.options & HttpServerOption.ParseQueryString ){
 				if( !(settings.options & HttpServerOption.ParseURL) )
 					logWarn("Query string parsing requested but URL parsing is disabled!");
-				parseFormData(req.queryString, req.query);
+				parseUrlEncodedForm(req.queryString, req.query);
 			}
 
 			// cookie parsing if desired
@@ -881,10 +939,7 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 
 			if( settings.options & HttpServerOption.ParseFormBody ){
 				auto ptype = "Content-Type" in req.headers;				
-				if( ptype && *ptype == "application/x-www-form-urlencoded" ){
-					auto bodyStr = cast(string)req.bodyReader.readAll();
-					parseFormData(bodyStr, req.form);
-				}
+				if( ptype ) parseFormData(req.form, req.files, *ptype, req.bodyReader);
 			}
 
 			if( settings.options & HttpServerOption.ParseJsonBody ){
@@ -902,57 +957,62 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 			res.headers["Date"] = toRFC822DateTimeString(Clock.currTime().toUTC());
 			if( req.persistent ) res.headers["Keep-Alive"] = "timeout="~to!string(settings.keepAliveTimeout.total!"seconds"());
 
-
-			logTrace("handle request (body %d)", req.bodyReader.leastSize);
-
+			// finished parsing the request
+			parsed = true;
 
 			// handle the request
-			try {
-				res.httpVersion = req.httpVersion;
-				request_task(req, res);
-			} catch (HttpServerError err) {
-				logDebug("http error thrown: %s", err.toString());
-				if( !res.headerWritten ) errorOut(err.status, err.msg, err.toString());
-				if (justifiesConnectionClose(err.status)) {
-					conn_.close();
-					break;
-				}
-			} catch (Throwable e) {
-				logDebug("exception thrown during request handling: %s", e.toString());
-				if( !res.headerWritten ) errorOut(HttpStatus.InternalServerError, "Error handling request.", e.toString());
-				else logError("Error after page has been written: %s", e.toString());
-				logDebug("Exception while handling request: %s", e.toString());
-			} 
+			logTrace("handle request (body %d)", req.bodyReader.leastSize);
+			res.httpVersion = req.httpVersion;
+			request_task(req, res);
 		} catch(HttpServerError err) {
 			logDebug("http error thrown: %s", err.toString());
-			if ( !res.headerWritten ) errorOut(err.status, err.msg, err.toString());
+			if ( !res.headerWritten ) errorOut(err.status, err.msg, err.toString(), err);
 			else logError("HttpServerError after page has been written: %s", err.toString());
-			if (justifiesConnectionClose(err.status)) {
+			logDebug("Exception while handling request: %s", err.toString());
+			if ( !parsed || justifiesConnectionClose(err.status) ) {
 				conn_.close();
 				break;
 			}
 		} catch (Throwable e) {
 			logDebug("Exception while parsing request: %s", e.toString());
-			if( !res.headerWritten ) errorOut(HttpStatus.BadRequest, "Invalid request format.", e.toString());
-			else logError("Error after page has been written: %s", e.toString());
+			if( !res.headerWritten ) errorOut(parsed ? HttpStatus.InternalServerError :
+				HttpStatus.BadRequest, "Invalid request format.", e.toString(), e);
+			else logError("Error after page has been written: %s", e.msg);
+			logDebug("Exception while handling request: %s", e.toString());
+			if ( !parsed ) {
+				conn_.close();
+				break;
+			}
 		}
 
-		if( !res.headerWritten ) errorOut(HttpStatus.NotFound, "Not found.", "");
+		// if no one has written anything, return 404
+		if( !res.headerWritten ) errorOut(HttpStatus.NotFound, "Not found.", "", null);
 
-		res.finalize();	
+		nullWriter.write(req.bodyReader);
 
+		// finalize (e.g. for chunked encoding)
+		res.finalize();
+
+		foreach( k, v ; req.files ){
+			if( existsFile(v.tempPath) ) {
+				removeFile(v.tempPath); 
+				logDebug("Deleted upload tempfile %s", v.tempPath.toString()); 
+			}
+		}
+
+		// log the request to access log
 		foreach( log; context.loggers )
 			log.log(req, res);
 
+		// wait for another possible request on a keep-alive connection
 		if( req.persistent && !conn_.waitForData(settings.keepAliveTimeout) ) {
 			logDebug("persistent connection timeout!");
 			break;
 		}
-
 	} while( req.persistent && conn_.connected );
 }
 
-private HttpServerRequest parseRequest(Stream conn)
+private HttpServerRequest parseRequest(InputStream conn)
 {
 	auto req = new HttpServerRequest;
 	auto stream = new LimitedHttpInputStream(conn, MaxHttpRequestHeaderSize);
@@ -977,48 +1037,9 @@ private HttpServerRequest parseRequest(Stream conn)
 	req.httpVersion = parseHttpVersion(reqln);
 	
 	//headers
-	string ln;
-	while( (ln = cast(string)stream.readLine(MaxHttpHeaderLineLength)).length > 0 ){
-		logTrace("hdr: %s", ln);
-		auto colonpos = ln.indexOf(':');
-		if( colonpos > 0 && colonpos < ln.length - 1 ) {
-			auto name = ln[0..colonpos].strip();
-			auto value = ln[colonpos+1..$].strip();
-
-			if( auto pv = name in req.headers ) {
-				*pv ~= "," ~ value;
-			} else {
-				req.headers[name] = value;
-			}
-		}
-	}
-
-	//handle Expect-Header
-	if( auto pv = "Expect" in req.headers) {
-		if( *pv == "100-continue" ) {
-			logTrace("sending 100 continue");
-			conn.write("HTTP/1.1 100 Continue\r\n");
-		}
-	}
+	parseRfc5322Header(stream, req.headers, MaxHttpHeaderLineLength);
 
 	return req;
-}
-
-private void parseFormData(string str, ref string[string] params)
-{
-	while(str.length > 0){
-		// name part
-		auto idx = str.indexOf('=');
-		enforce(idx > 0, "Expected ident=value.");
-		string name = urlDecode(str[0 .. idx]);
-		str = str[idx+1 .. $];
-
-		// value part
-		for( idx = 0; idx < str.length && str[idx] != '&' && str[idx] != ';'; idx++) {}
-		string value = urlDecode(str[0 .. idx]);
-		params[name] = value;
-		str = idx < str.length ? str[idx+1 .. $] : null;
-	}
 }
 
 private void parseCookies(string str, ref string[string] cookies) 

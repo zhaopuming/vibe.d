@@ -43,8 +43,8 @@ Where OPT is one of
 		
 	Advanced options:
 		-annotate: without actually updating, check for the status of the application
-		-keepDepsTxt: does not write out the deps.txt
 		-verbose: prints out lots of debug information
+		-vverbose: even more debug output
 
 APP_OP will be passed on to the application to be run.");
 }
@@ -83,8 +83,8 @@ int main(string[] args)
 		else {
 			if(canFind(vpmArgs, "-verbose"))
 				setLogLevel(LogLevel.Debug);
-			else
-				setLogLevel(LogLevel.Info);
+			if(canFind(vpmArgs, "-vverbose"))
+				setLogLevel(LogLevel.Trace);
 
 			auto appPath = getcwd();
 			logInfo("Updating application in '%s'", appPath);
@@ -97,26 +97,27 @@ int main(string[] args)
 			
 			vpm.update(parseOptions(vpmArgs));
 			
-			if(!canFind(vpmArgs, "-keepDepsTxt"))
-				vpm.createDepsTxt();
-
 			string binName = (Path(".") ~ "app").toNativeString();
 			version(Windows) { binName ~= ".exe"; }
 
 			// Create start script, which will be used by the calling bash/cmd script.			
 			// build "rdmd --force %DFLAGS% -I%~dp0..\source -Jviews -Isource @deps.txt %LIBS% source\app.d" ~ application arguments
 			// or with "/" instead of "\"
-			appStartScript = "rdmd " ~
-				"--force " ~
-				"-of" ~ binName ~ " " ~
-				(canFind(vpmArgs, "build")? "--build-only " : " ") ~
-				"-I" ~ (vibedDir ~ ".." ~ "source").toNativeString() ~ " " ~
-				"-Jviews -Isource " ~
-				(exists("deps.txt")? "@deps.txt " : " ") ~
-				getLibs(vibedDir) ~ " " ~
-				getDflags() ~ " " ~
-				(Path("source") ~ "app.d").toNativeString() ~
-				reduce!("a ~ ' ' ~ b")("", appArgs);
+			string[] flags = ["--force"];
+			if( canFind(vpmArgs, "build") ){
+				flags ~= "--build-only";
+				flags ~= "-of"~binName;
+			}
+			flags ~= "-g";
+			flags ~= "-I" ~ (vibedDir ~ ".." ~ "source").toNativeString();
+			flags ~= "-Isource";
+			flags ~= "-Jviews";
+			flags ~= vpm.dflags;
+			flags ~= getLibs(vibedDir);
+			flags ~= (Path("source") ~ "app.d").toNativeString();
+			flags ~= appArgs;
+
+			appStartScript = "rdmd " ~ getDflags() ~ " " ~ join(flags, " ");
 		}
 
 		auto script = openFile(to!string(dstScript), FileMode.CreateTrunc);
@@ -145,6 +146,7 @@ private size_t lastVpmArg(string[] args)
 		"-annotate",
 		"-keepDepsTxt",
 		"-verbose"
+		"-vverbose"
 	];
 	foreach(k,s; args) 
 		if( false == reduce!((bool a, string b) => a || s.startsWith(b))(false, vpmArgs) )
@@ -170,18 +172,18 @@ private string getDflags()
 	return globVibedDflags;
 }
 
-private string getLibs(Path vibedDir) 
+private string[] getLibs(Path vibedDir) 
 {
 	version(Windows)
 	{
 		auto libDir = vibedDir ~ "..\\lib\\win-i386";
-		return "ws2_32.lib " ~ 
-			(libDir ~ "event2.lib").toNativeString() ~ " " ~
-			(libDir ~ "eay.lib").toNativeString() ~ " " ~
-			(libDir ~ "ssl.lib").toNativeString();
+		return ["ws2_32.lib", 
+			(libDir ~ "event2.lib").toNativeString(),
+			(libDir ~ "eay.lib").toNativeString(),
+			(libDir ~ "ssl.lib").toNativeString()];
 	}
 	version(Posix)
 	{
-		return "-L-levent -L-levent_openssl -L-lssl -L-lcrypto";
+		return split(environment.get("LIBS", "-L-levent_openssl -L-levent"));
 	}
 }

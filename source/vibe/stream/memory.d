@@ -1,7 +1,7 @@
 /**
 	In-memory streams
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -21,7 +21,7 @@ class MemoryOutputStream : OutputStream {
 		m_destination.clear();
 	}
 
-	ubyte[] getData() { return m_destination.data(); }
+	@property ubyte[] data() { return m_destination.data(); }
 
 	void write(in ubyte[] bytes, bool do_flush = true)
 	{

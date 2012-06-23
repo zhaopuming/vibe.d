@@ -1,7 +1,7 @@
 /**
 	String validation routines
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -12,6 +12,7 @@ import vibe.utils.string;
 import std.algorithm;
 import std.exception;
 import std.conv;
+import std.utf;
 //import std.net.isemail; // does not link
 
 
@@ -91,5 +92,15 @@ string validatePassword(string str, string str_confirm, size_t min_length = 8, s
 	enforce(str.length <= max_length,
 		"The password must not be longer than "~to!string(max_length)~" characters.");
 	enforce(str == str_confirm, "The password and the confirmation differ.");
+	return str;
+}
+
+string validateString(string str, size_t min_length = 0, size_t max_length = 0, string entity_name = "String")
+{
+	std.utf.validate(str);
+	enforce(str.length >= min_length,
+		entity_name~" must be at least "~to!string(min_length)~" characters long.");
+	enforce(!max_length || str.length <= max_length,
+		entity_name~" must not be longer than "~to!string(min_length)~" characters.");
 	return str;
 }

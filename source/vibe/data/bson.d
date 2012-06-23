@@ -1,7 +1,7 @@
 /**
 	BSON serialization and value handling.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -493,7 +493,7 @@ struct BsonObjectID {
 		m_bytes[] = bytes;
 	}
 
-	static BsonObjectID fromHexString(string str)
+	static BsonObjectID fromString(string str)
 	{
 		assert(str.length == 24, "BSON Object ID string s must be 24 characters.");
 		BsonObjectID ret = void;
@@ -514,6 +514,8 @@ struct BsonObjectID {
 		}
 		return ret;
 	}
+
+	alias fromString fromHexString;
 
 	static BsonObjectID generate()
 	{

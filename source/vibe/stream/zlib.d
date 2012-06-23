@@ -1,7 +1,7 @@
 /**
 	Zlib input/output streams
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -10,6 +10,7 @@ module vibe.stream.zlib;
 import vibe.stream.stream;
 
 import std.algorithm;
+import std.exception;
 import std.zlib;
 
 
@@ -109,6 +110,7 @@ class ZlibInputStream : InputStream {
 		InputStream m_in;
 		UnCompress m_uncomp;
 		ubyte[] m_buffer;
+		bool m_finished = false;
 	}
 
 	this(InputStream src, HeaderFormat type)
@@ -119,9 +121,8 @@ class ZlibInputStream : InputStream {
 
 	@property bool empty()
 	{
-		if( m_buffer.length ) return false;
-		if( !m_in.empty ) return false;
-		return true;
+		assert(!m_finished || m_in.empty);
+		return m_finished && m_buffer.length == 0;
 	}
 
 	@property ulong leastSize()
@@ -144,26 +145,22 @@ class ZlibInputStream : InputStream {
 
 	void read(ubyte[] dst)
 	{
+		enforce(dst.length == 0 || !empty, "Reading empty stream");
 		while( dst.length > 0 ){
+			enforce(!empty, "Reading zlib stream past EOS");
 			size_t sz = min(m_buffer.length, dst.length);
 			dst[0 .. sz] = m_buffer[0 .. sz];
 			dst = dst[sz .. $];
 			m_buffer = m_buffer[sz .. $];
-			if( !m_buffer.length ) readChunk();
+			if( !m_buffer.length && !m_finished )
+				readChunk();
 		}
 	}
 
-	ubyte[] readLine(size_t max_bytes = 0, string linesep = "\r\n")
-	{
-		return readLineDefault(max_bytes, linesep);
-	}
-
-	ubyte[] readAll(size_t max_bytes = 0) { return readAllDefault(max_bytes); }
-
-
 	private void readChunk()
 	{
-		assert(m_buffer.length == 0);
+		assert(m_buffer.length == 0, "readChunk called before buffer was emptied");
+		assert(!m_finished, "readChunk called after zlib stream was finished.");
 		auto chunk = new ubyte[4096];
 		while(!m_in.empty && m_buffer.length == 0){
 			auto sz = min(m_in.leastSize, 4096);
@@ -173,6 +170,7 @@ class ZlibInputStream : InputStream {
 
 		if( m_buffer.length == 0 ){
 			m_buffer = cast(ubyte[])m_uncomp.flush();
+			m_finished = true;
 		}
 	}
 }

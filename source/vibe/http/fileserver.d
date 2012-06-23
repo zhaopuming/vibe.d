@@ -1,7 +1,7 @@
 /**
 	A static HTTP file server.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -11,6 +11,7 @@ import vibe.core.file;
 import vibe.core.log;
 import vibe.http.server;
 import vibe.inet.mimetypes;
+import vibe.inet.url;
 import vibe.crypto.md5;
 
 import std.conv;
@@ -36,6 +37,8 @@ HttpServerRequestDelegate serveStaticFiles(string local_path, HttpFileServerSett
 	if( !local_path.endsWith("/") ) local_path ~= "/";
 	if( !settings.serverPathPrefix.endsWith("/") ) settings.serverPathPrefix ~= "/";
 
+	auto lpath = Path(local_path);
+
 	void callback(HttpServerRequest req, HttpServerResponse res)
 	{
 		string srv_path;
@@ -49,14 +52,13 @@ HttpServerRequestDelegate serveStaticFiles(string local_path, HttpFileServerSett
 		}
 		
 		auto rel_path = srv_path[settings.serverPathPrefix.length .. $];
+		auto rpath = Path(rel_path);
 		logTrace("Processing '%s'", srv_path);
-		foreach( p; rel_path.split("/") ){
-			if( p == "" || p == "." || p == ".." || p.indexOf("\\") > 0 ){
-				return;
-			}
-		}
+		rpath.normalize();
+		logDebug("Path '%s' -> '%s'", rel_path, rpath.toNativeString());
+		if( rpath[0] == ".." ) return; // don't respond to relative paths outside of the root path
 
-		string path = local_path ~ rel_path;
+		string path = (lpath ~ rpath).toNativeString();
 
 		DirEntry dirent;
 		try dirent = dirEntry(path);

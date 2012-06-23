@@ -1,7 +1,7 @@
 /**
 	Low level mongodb protocol.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -21,7 +21,7 @@ import std.exception;
 
 	Note that a MongoConnection my only be used from one fiber/thread at a time.
 */
-class MongoConnection {
+class MongoConnection : EventedObject {
 	private {
 		string m_host;
 		ushort m_port;
@@ -37,8 +37,9 @@ class MongoConnection {
 	}
 
 	// changes the ownership of this connection
-	void acquire() { if( m_conn ) m_conn.acquire(); }
-	void release() { if( m_conn ) m_conn.release(); }
+	override void acquire() { if( m_conn ) m_conn.acquire(); }
+	override void release() { if( m_conn ) m_conn.release(); }
+	override bool isOwner() { return m_conn ? m_conn.isOwner() : true; }
 
 	void connect()
 	{
@@ -189,10 +190,7 @@ class MongoConnection {
 
 	private void sendInt(int v) { send(toBsonData(v)); }
 	private void sendLong(long v) { send(toBsonData(v)); }
-	private void send(in ubyte[] data){
-		if( !m_conn ) connect();
-		m_conn.write(data, false);
-	}
+	private void send(in ubyte[] data){ m_conn.write(data, false); }
 
 	private int recvInt() { ubyte[int.sizeof] ret; recv(ret); return fromBsonData!int(ret); }
 	private long recvLong() { ubyte[long.sizeof] ret; recv(ret); return fromBsonData!long(ret); }

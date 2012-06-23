@@ -5,7 +5,7 @@
 	vibe.d applications will import 'vibe.d' instead to also get an implicit application entry
 	point.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Sönke Ludwig
 */
@@ -36,10 +36,13 @@ public import vibe.inet.url;
 public import vibe.inet.urltransfer;
 public import vibe.mail.smtp;
 //public import vibe.stream.base64;
+public import vibe.stream.counting;
+public import vibe.stream.memory;
 public import vibe.stream.stream;
 public import vibe.stream.ssl;
 public import vibe.stream.zlib;
 public import vibe.templ.diet;
+public import vibe.templ.utils;
 public import vibe.textfilter.ddoc;
 public import vibe.textfilter.html;
 public import vibe.textfilter.markdown;

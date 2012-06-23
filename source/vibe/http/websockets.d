@@ -1,7 +1,7 @@
 /**
 	WebSocket support and fallbacks for older browsers.
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 	Authors: Jan Krüger
 */
@@ -167,14 +167,6 @@ class IncommingWebSocketMessage : InputStream {
 
 			if( leastSize == 0 && !m_currentFrame.fin ) m_currentFrame = Frame.readFrame(m_conn);
 		}
-	}
-
-	ubyte[] readLine(size_t max_bytes = 0, string linesep = "\r\n") {
-		return readLineDefault(max_bytes, linesep);
-	}
-
-	ubyte[] readAll(size_t max_bytes = 0) {
-		return readAllDefault(max_bytes);
 	}
 
 	private void readFrame() {

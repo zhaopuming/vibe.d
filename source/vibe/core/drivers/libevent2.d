@@ -1,7 +1,7 @@
 /**
 	libevent based driver
 
-	Copyright: © 2012 Sönke Ludwig
+	Copyright: © 2012 RejectedSoftware e.K.
 	Authors: Sönke Ludwig
 	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
 */
@@ -11,57 +11,164 @@ import vibe.core.driver;
 import vibe.core.drivers.libevent2_tcp;
 import vibe.core.drivers.threadedfile;
 import vibe.core.log;
+import vibe.utils.memory;
 
 import deimos.event2.bufferevent;
 import deimos.event2.dns;
 import deimos.event2.event;
+import deimos.event2.thread;
 import deimos.event2.util;
 
 import core.memory;
+import core.stdc.stdlib;
+import core.sync.condition;
+import core.sync.mutex;
+import core.sync.rwmutex;
 import core.sys.posix.netinet.in_;
 import core.sys.posix.netinet.tcp;
 version(Windows) import std.c.windows.winsock;
 import core.thread;
 import std.conv;
 import std.exception;
+import std.range;
 import std.string;
 
-private extern(C){
-	void* myalloc(size_t size){ return GC.malloc(size); }
-	void* myrealloc(void* p, size_t newsize){ return GC.realloc(p, newsize); }
-	void myfree(void* p){ GC.free(p); }
+struct LevMutex {
+	Mutex mutex;
+	ReadWriteMutex rwmutex;
 }
 
+struct LevCondition {
+	Condition cond;
+	LevMutex* mutex;
+}
+
+private extern(C){
+	void* lev_alloc(size_t size){ return malloc(size); }
+	void* lev_realloc(void* p, size_t newsize){ return realloc(p, newsize); }
+	void lev_free(void* p){ free(p); }
+
+	void* lev_alloc_mutex(uint locktype) {
+		auto ret = cast(LevMutex*)calloc(1, LevMutex.sizeof);
+		GC.addRange(ret, LevMutex.sizeof);
+		if( locktype == EVTHREAD_LOCKTYPE_READWRITE ) ret.rwmutex = new ReadWriteMutex;
+		else ret.mutex = new Mutex;
+		return ret;
+	}
+	void lev_free_mutex(void* lock, uint locktype) { GC.removeRange(lock); free(lock); }
+	int lev_lock_mutex(uint mode, void* lock) {
+		auto mtx = cast(LevMutex*)lock;
+		
+		if( mode & EVTHREAD_WRITE ){
+			if( mode & EVTHREAD_TRY ) return mtx.rwmutex.writer().tryLock() ? 0 : 1;
+			else mtx.rwmutex.writer().lock();
+		} else if( mode & EVTHREAD_READ ){
+			if( mode & EVTHREAD_TRY ) return mtx.rwmutex.reader().tryLock() ? 0 : 1;
+			else mtx.rwmutex.reader().lock();
+		} else {
+			if( mode & EVTHREAD_TRY ) return mtx.mutex.tryLock() ? 0 : 1;
+			else mtx.mutex.lock();
+		}
+		return 0;
+	}
+	int lev_unlock_mutex(uint mode, void* lock) {
+		auto mtx = cast(LevMutex*)lock;
+
+		if( mode & EVTHREAD_WRITE ){
+			mtx.rwmutex.writer().unlock();
+		} else if( mode & EVTHREAD_READ ){
+			mtx.rwmutex.reader().unlock();
+		} else {
+			mtx.mutex.unlock();
+		}
+		return 0;
+	}
+
+	void* lev_alloc_condition(uint condtype) {
+		auto ret = cast(LevCondition*)calloc(1, LevCondition.sizeof);
+		GC.addRange(ret, LevCondition.sizeof);
+		return ret;
+	}
+	void lev_free_condition(void* cond) { GC.removeRange(cond); free(cond); }
+	int lev_signal_condition(void* cond, int broadcast) {
+		auto c = cast(LevCondition*)cond;
+		if( c.cond ) c.cond.notifyAll();
+		return 0;
+	}
+	int lev_wait_condition(void* cond, void* lock, const(timeval)* timeout) {
+		auto c = cast(LevCondition*)cond;
+		if( c.mutex is null ) c.mutex = cast(LevMutex*)lock;
+		assert(c.mutex.mutex !is null); // RW mutexes are not supported for conditions!
+		assert(c.mutex is lock);
+		if( c.cond is null ) c.cond = new Condition(c.mutex.mutex);
+		if( timeout ){
+			if( !c.cond.wait(dur!"seconds"(timeout.tv_sec) + dur!"usecs"(timeout.tv_usec)) )
+				return 1;
+		} else c.cond.wait();
+		return 0;
+	}
+
+	size_t lev_get_thread_id() { return cast(size_t)cast(void*)Thread.getThis(); }
+}
 
 class Libevent2Driver : EventDriver {
 	private {
 		DriverCore m_core;
 		event_base* m_eventLoop;
 		evdns_base* m_dnsBase;
+		Libevent2WorkerThread[] m_workerThreads;
 	}
 
 	this(DriverCore core)
 	{
 		m_core = core;
+		s_driverCore = core;
 
 		// set the malloc/free versions of our runtime so we don't run into trouble
 		// because the libevent DLL uses a different one.
-		event_set_mem_functions(&myalloc, &myrealloc, &myfree);
+		event_set_mem_functions(&lev_alloc, &lev_realloc, &lev_free);
+
+		evthread_lock_callbacks lcb;
+		lcb.lock_api_version = EVTHREAD_LOCK_API_VERSION;
+		lcb.supported_locktypes = EVTHREAD_LOCKTYPE_RECURSIVE|EVTHREAD_LOCKTYPE_READWRITE;
+		lcb.alloc = &lev_alloc_mutex;
+		lcb.free = &lev_free_mutex;
+		lcb.lock = &lev_lock_mutex;
+		lcb.unlock = &lev_unlock_mutex;
+		evthread_set_lock_callbacks(&lcb);
+
+		evthread_condition_callbacks ccb;
+		ccb.condition_api_version = EVTHREAD_CONDITION_API_VERSION;
+		ccb.alloc_condition = &lev_alloc_condition;
+		ccb.free_condition = &lev_free_condition;
+		ccb.signal_condition = &lev_signal_condition;
+		ccb.wait_condition = &lev_wait_condition;
+		evthread_set_condition_callbacks(&ccb);
+
+		evthread_set_id_callback(&lev_get_thread_id);
 
 		// initialize libevent
 		logDebug("libevent version: %s", to!string(event_get_version()));
 		m_eventLoop = event_base_new();
+		s_eventLoop = m_eventLoop;
 		logDebug("libevent is using %s for events.", to!string(event_base_get_method(m_eventLoop)));
+		evthread_make_base_notifiable(m_eventLoop);
 		
 		m_dnsBase = evdns_base_new(m_eventLoop, 1);
 		if( !m_dnsBase ) logError("Failed to initialize DNS lookup.");
+
+		version(MultiThreadTest){
+			foreach( i; 0 .. 4 )
+				startWorkerThread();
+		}
 	}
 
-	/*~this()
+	~this()
 	{
+		s_alreadyDeinitialized = true;
 		evdns_base_free(m_dnsBase, 1);
 		event_base_free(m_eventLoop);
-	}*/
+	}
 
 	@property event_base* eventLoop() { return m_eventLoop; }
 	@property evdns_base* dnsEngine() { return m_dnsBase; }
@@ -79,6 +186,18 @@ class Libevent2Driver : EventDriver {
 	void exitEventLoop()
 	{
 		enforce(event_base_loopbreak(m_eventLoop) == 0, "Failed to exit libevent event loop.");
+		foreach( loop; m_workerThreads )
+			loop.exit();
+	}
+
+	void runWorkerTask(void delegate() f)
+	{
+		if( m_workerThreads.length == 0 ){
+			runTask(f);
+		} else {
+			// TODO: do some meaningful scheduling!
+			m_workerThreads[0].addTask(f);
+		}
 	}
 
 	FileStream openFile(string path, FileMode mode)
@@ -98,7 +217,7 @@ class Libevent2Driver : EventDriver {
 		auto buf_event = bufferevent_socket_new(m_eventLoop, sockfd, bufferevent_options.BEV_OPT_CLOSE_ON_FREE);
 		if( !buf_event ) throw new Exception("Failed to create buffer event for socket.");
 
-		auto cctx = new TcpContext(m_core, m_eventLoop, null, sockfd, buf_event);
+		auto cctx = heap_new!TcpContext(m_core, m_eventLoop, sockfd, buf_event);
 		cctx.task = Fiber.getThis();
 		bufferevent_setcb(buf_event, &onSocketRead, &onSocketWrite, &onSocketEvent, cctx);
 		timeval toread = {tv_sec: 60, tv_usec: 0};
@@ -157,6 +276,12 @@ class Libevent2Driver : EventDriver {
 		return new Libevent2Timer(this, callback);
 	}
 
+	private void startWorkerThread()
+	{
+		auto thr = new Libevent2WorkerThread;
+		m_workerThreads ~= thr;
+	}
+
 	private int listenTcpGeneric(SOCKADDR)(int af, SOCKADDR* sock_addr, ushort port, void delegate(TcpConnection conn) connection_callback)
 	{
 		auto listenfd = socket(af, SOCK_STREAM, 0);
@@ -187,7 +312,8 @@ class Libevent2Driver : EventDriver {
 		version(Windows){} else evutil_make_listen_socket_reuseable(listenfd);
 
 		// Add an event to wait for connections
-		auto ctx = new TcpContext(m_core, m_eventLoop, connection_callback, listenfd, null, *sock_addr);
+		auto ctx = heap_new!TcpContext(m_core, m_eventLoop, listenfd, null, *sock_addr);
+		ctx.connectionCallback = connection_callback;
 		auto connect_event = event_new(m_eventLoop, listenfd, EV_READ | EV_PERSIST, &onConnect, ctx);
 		if( event_add(connect_event, null) ){
 			logError("Error scheduling connection event on the event loop.");
@@ -196,6 +322,112 @@ class Libevent2Driver : EventDriver {
 		// TODO: do something with connect_event (at least store somewhere for clean up)
 		
 		return 0;
+	}
+}
+
+class Libevent2WorkerThread {
+	private {
+		Thread m_thread;
+		event_base* m_eventLoop;
+		evdns_base* m_dnsBase;
+		void delegate()[] m_taskQueue;
+		Mutex m_taskQueueMutex;
+		event* m_wakeEvent;
+	}
+
+	this()
+	{
+		m_taskQueueMutex = new Mutex;
+		m_thread = new Thread(&workerLoop);
+		m_thread.name = "libevent worker thread";
+		m_thread.start();
+	}
+
+	void exit()
+	{
+		enforce(event_base_loopbreak(m_eventLoop) == 0, "Failed to exit libevent worker loop.");
+	}
+
+	void addTask(void delegate() f)
+	{
+		synchronized(m_taskQueueMutex){
+			m_taskQueue ~= f;
+		}
+		wakeUp();
+	}
+
+	void wakeUp()
+	{
+		event_active(m_wakeEvent, 0, 0);
+	}
+
+	private void workerLoop()
+	{
+		scope(exit) logInfo("Worker thread exit");
+		try {
+			logTrace("creating worker loop");
+			m_eventLoop = event_base_new();
+			if(m_eventLoop is null){
+				logError("Failed to create worker loop.");
+				return;
+			}
+			s_eventLoop = m_eventLoop;
+			logTrace("created worker loop");
+
+			logDebug("libevent worker is using %s for events.", to!string(event_base_get_method(m_eventLoop)));
+			evthread_make_base_notifiable(m_eventLoop);
+
+			logTrace("creating worker dns base");
+			
+			m_dnsBase = evdns_base_new(m_eventLoop, 1);
+			if( !m_dnsBase ) logError("Failed to initialize DNS lookup.");
+
+			logTrace("creating worker wake event");
+
+			m_wakeEvent = event_new(m_eventLoop, -1, EV_PERSIST, &onNewTask, cast(void*)this);
+			if( m_wakeEvent is null ) logDebug("Failed to create dummy event");
+
+			logTrace("adding worker wake event");
+			if( event_add(m_wakeEvent, null) != 0 )
+				logDebug("Failed to add dummy event");
+
+			logDebug("Starting worker loop..");
+			if( auto ret = event_base_loop(m_eventLoop, 0) != 0){
+				logError("Failed to run worker loop: %d", ret);
+				return;
+			}
+			logDebug("Finished worker loop..");
+
+			event_free(m_wakeEvent);
+			evdns_base_free(m_dnsBase, false);
+			event_base_free(m_eventLoop);
+		} catch( Throwable e ){
+			logError("Worker thread failed with uncaught exception: %s", e.toString());
+		}
+	}
+
+	private void runTasks()
+	{
+		while(true){
+			void delegate() task;
+			synchronized(m_taskQueueMutex){
+				if( m_taskQueue.empty ) break;
+				task = m_taskQueue.front;
+				m_taskQueue.popFront();
+			}
+			runTask(task);
+		}
+	}
+
+	private static extern(C) nothrow
+	void onNewTask(evutil_socket_t, short events, void* userptr)
+	{
+		auto thr = cast(Libevent2WorkerThread)userptr;
+		try {
+			thr.runTasks();
+		} catch( Throwable e ){	
+			logError("Error running worker tasks: %s", e.msg);
+		}
 	}
 }
 
@@ -216,7 +448,8 @@ class Libevent2Signal : Signal {
 
 	~this()
 	{
-		event_free(m_event);
+		if( !s_alreadyDeinitialized )
+			event_free(m_event);
 	}
 
 	void emit()
@@ -270,11 +503,15 @@ class Libevent2Timer : Timer {
 	{
 		m_driver = driver;
 		m_callback = callback;
+		m_event = event_new(m_driver.eventLoop, -1, 0, &onTimerTimeout, cast(void*)this);
 	}
 
 	~this()
 	{
-		stop();
+		if( !s_alreadyDeinitialized ){
+			stop();
+			event_free(m_event);
+		}
 	}
 
 	void acquire()
@@ -303,21 +540,20 @@ class Libevent2Timer : Timer {
 	{
 		stop();
 
-		m_event = event_new(m_driver.eventLoop, -1, 0, &onTimerTimeout, cast(void*)this);
 		assert(timeout.total!"seconds"() <= int.max);
 		m_timeout.tv_sec = cast(int)timeout.total!"seconds"();
 		m_timeout.tv_usec = timeout.fracSec().usecs();
+		assert(m_timeout.tv_sec > 0 || m_timeout.tv_usec > 0);
 		event_add(m_event, &m_timeout);
+		assert(event_pending(m_event, EV_TIMEOUT, null));
 		m_pending = true;
 		m_periodic = periodic;
 	}
 
-	void stop()
+	void stop() nothrow
 	{
 		if( m_event ){
 			event_del(m_event);
-			event_free(m_event);
-			m_event = null;
 		}
 		m_pending = false;
 	}
@@ -332,28 +568,59 @@ class Libevent2Timer : Timer {
 	}
 }
 
-private extern(C) void onSignalTriggered(evutil_socket_t, short events, void* userptr)
-{
-	auto sig = cast(Libevent2Signal)userptr;
-
-	sig.m_emitCount++;
-
-	auto lst = sig.m_listeners.dup;
-	
-	foreach( l, _; lst )
-		sig.m_driver.m_core.resumeTask(l);
+private {
+	event_base* s_eventLoop; // TLS
+	__gshared DriverCore s_driverCore;
+	shared s_alreadyDeinitialized = false;
 }
 
-private extern(C) void onTimerTimeout(evutil_socket_t, short events, void* userptr)
+package event_base* getThreadLibeventEventLoop()
 {
-	auto tm = cast(Libevent2Timer)userptr;
-	if( !tm.m_pending ) return;
-	if( tm.m_periodic ){
-		event_del(tm.m_event);
-		event_add(tm.m_event, &tm.m_timeout);
-	} else {
-		tm.stop();
+	return s_eventLoop;
+}
+
+package DriverCore getThreadLibeventDriverCore()
+{
+	return s_driverCore;
+}
+
+
+private extern(C) nothrow
+{
+	void onSignalTriggered(evutil_socket_t, short events, void* userptr)
+	{
+		auto sig = cast(Libevent2Signal)userptr;
+
+		sig.m_emitCount++;
+
+		bool[Fiber] lst;
+		try {
+			lst = sig.m_listeners.dup;
+			foreach( l, _; lst )
+				sig.m_driver.m_core.resumeTask(l);
+		} catch( Exception e ){
+			logError("Exception while handling signal event: %s", e.msg);
+			debug assert(false);
+		}
 	}
 
-	runTask(tm.m_callback);
+	void onTimerTimeout(evutil_socket_t, short events, void* userptr)
+	{
+		auto tm = cast(Libevent2Timer)userptr;
+		logTrace("Timer event %s/%s", tm.m_pending, tm.m_periodic);
+		if( !tm.m_pending ) return;
+		try {
+			if( tm.m_periodic ){
+				event_del(tm.m_event);
+				event_add(tm.m_event, &tm.m_timeout);
+			} else {
+				tm.stop();
+			}
+
+			runTask(tm.m_callback);
+		} catch( Exception e ){
+			logError("Exception while handling timer event: %s", e.msg);
+			debug assert(false);
+		}
+	}
 }

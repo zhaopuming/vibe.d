@@ -11,6 +11,7 @@ module vibe.vpm.vpm;
 import std.algorithm;
 import std.array;
 import std.conv;
+import std.datetime;
 import std.exception;
 import std.file;
 import std.path;
@@ -55,6 +56,7 @@ private struct Action {
 private class Application {
 	private {
 		Path m_root;
+		Json m_json;
 		Package m_main;
 		Package[string] m_packages;
 	}
@@ -88,6 +90,14 @@ private class Application {
 		m_packages.clear();
 		m_main = null;
 		
+		try {
+			m_json = jsonFromFile(m_root ~ "vpm.json");
+		}
+		catch(Throwable t) {
+			Json[string] j;
+			m_json = j;
+		}
+		
 		if(!exists(to!string(m_root~"package.json"))) {
 			logWarn("There was no 'package.json' found for the application in '%s'.", m_root);
 		}
@@ -109,75 +119,39 @@ private class Application {
 			}
 		}
 	}
-	
-	/// Include paths for all installed modules
-	string[] includePaths(bool views) const {
-		// Assumeed that there is a \source folder
-		string[] includes;
-		string ipath() { return (views?"views":"source"); }
-		foreach(string s, pkg; m_packages) {
-			auto path = "modules/"~pkg.name~"/"~ipath();
-			if( exists(path) && path.isDir )
-				includes ~= path;
+
+	@property string[] dflags() const {
+		auto ret = appender!(string[])();
+		if( m_main ) ret.put(m_main.dflags());
+		ret.put("-Isource");
+		ret.put("-Jviews");
+		foreach( string s, pkg; m_packages ){
+			void addPath(string prefix, string name){
+				auto path = "modules/"~pkg.name~"/"~name;
+				if( exists(path) )
+					ret.put(prefix ~ path);
+			}
+			ret.put(pkg.dflags());
+			addPath("-I", "source");
+			addPath("-J", "views");
 		}
-		if( exists(ipath()) && ipath().isDir )
-			includes ~= ipath(); // app sources/templates
-		return includes;
+		return ret.data();
 	}
 	
 	/// Actions which can be performed to update the application.
-	Action[] actions(PackageSupplier packageSupplier, int option) const {
+	Action[] actions(PackageSupplier packageSupplier, int option) {
+		scope(exit) writeVpmJson();
+		
 		if(!m_main) {
 			Action[] a;
 			return a;
 		}
 		
 		auto graph = new DependencyGraph(m_main);
-		RequestedDependency[string] missing = graph.missing();
-		RequestedDependency[string] oldMissing;
-		bool gatherFailed = false;
-		while( missing.length > 0 ) {
-			if(missing.length == oldMissing.length) {
-				bool different = false;
-				foreach(string pkg, reqDep; missing) {
-					auto o = pkg in oldMissing;
-					if(o && reqDep.dependency != o.dependency) {
-						different = true; 
-						break;
-					}
-				}
-				if(!different) {
-					logWarn("Could not resolve dependencies");
-					gatherFailed = true;
-					break;
-				}
-			}
-			
-			oldMissing = missing.dup;
-			logTrace("There are %s packages missing.", missing.length);
-			foreach(string pkg, reqDep; missing) {
-				if(!reqDep.dependency.valid()) {
-					logTrace("Dependency to "~pkg~" is invalid. Trying to fix by modifying others.");
-					continue;
-				}
-				
-				logTrace("Adding package to graph: "~pkg);
-				try {
-					graph.insert(new Package(packageSupplier.packageJson(pkg, reqDep.dependency)));
-				}
-				catch(Throwable e) {
-					// catch?
-					logError("Trying to get package metadata failed, exception: %s", e.toString());
-				}
-			}
-			graph.clearUnused();
-			missing = graph.missing();
-		}
-		
-		if(gatherFailed) {
+		if(!gatherMissingDependencies(packageSupplier, graph)  || graph.missing().length > 0) {
 			logError("The dependency graph could not be filled.");
 			Action[] actions;
-			foreach( string pkg, rdp; missing)
+			foreach( string pkg, rdp; graph.missing())
 				actions ~= Action(Action.ActionId.Failure, pkg, rdp.dependency, rdp.packages);
 			return actions;
 		}
@@ -192,15 +166,15 @@ private class Application {
 		}
 		
 		// Gather installed
-		Rebindable!(const Package)[string] installed;
+		Package[string] installed;
 		installed[m_main.name] = m_main;
-		foreach(string pkg, ref const Package p; m_packages) {
+		foreach(string pkg, ref Package p; m_packages) {
 			enforce( pkg !in installed, "The package '"~pkg~"' is installed more than once." );
 			installed[pkg] = p;
 		}
 		
 		// To see, which could be uninstalled
-		Rebindable!(const Package)[string] unused = installed.dup;
+		Package[string] unused = installed.dup;
 		unused.remove( m_main.name );
 	
 		// Check against installed and add install actions
@@ -287,6 +261,115 @@ private class Application {
 		dst.write(cast(ubyte[])archive.build());
 		*/
 	}
+	
+	private bool gatherMissingDependencies(PackageSupplier packageSupplier, DependencyGraph graph) {
+		RequestedDependency[string] missing = graph.missing();
+		RequestedDependency[string] oldMissing;
+		while( missing.length > 0 ) {
+			if(missing.length == oldMissing.length) {
+				bool different = false;
+				foreach(string pkg, reqDep; missing) {
+					auto o = pkg in oldMissing;
+					if(o && reqDep.dependency != o.dependency) {
+						different = true; 
+						break;
+					}
+				}
+				if(!different) {
+					logWarn("Could not resolve dependencies");
+					return false;
+				}
+			}
+			
+			oldMissing = missing.dup;
+			logTrace("There are %s packages missing.", missing.length);
+			foreach(string pkg, reqDep; missing) {
+				if(!reqDep.dependency.valid()) {
+					logTrace("Dependency to "~pkg~" is invalid. Trying to fix by modifying others.");
+					continue;
+				}
+				
+				// TODO: auto update and update interval by time
+				logTrace("Adding package to graph: "~pkg);
+				Package p = null;
+				
+				// Try an already installed package first
+				if(!needsUpToDateCheck(pkg)) {
+					try {
+						auto json = jsonFromFile( m_root ~ Path("modules") ~ Path(pkg) ~ "package.json");
+						auto vers = Version(json["version"].get!string);
+						if( reqDep.dependency.matches( vers ) )
+							p = new Package(json);
+						logTrace("Using already installed package with version: %s", vers);
+					}
+					catch(Throwable e) {
+						// not yet installed, try the supplied PS
+						logTrace("An installed package was not found");
+					}
+				}
+				if(!p) {
+					try {
+						p = new Package(packageSupplier.packageJson(pkg, reqDep.dependency));
+						logTrace("using package from registry");
+						markUpToDate(pkg);
+					}
+					catch(Throwable e) {
+						logError("Geting package metadata for %s failed, exception: %s", pkg, e.toString());
+					}
+				}
+				
+				if(p)
+					graph.insert(p);
+			}
+			graph.clearUnused();
+			missing = graph.missing();
+		}
+		
+		return true;
+	}
+	
+	private bool needsUpToDateCheck(string packageId) {
+		try {
+			auto time = m_json["vpm"]["lastUpdate"][packageId].to!string;
+			return (Clock.currTime() - SysTime.fromISOExtString(time)) > dur!"days"(1);
+		}
+		catch(Throwable t) {
+			return true;
+		}
+	}
+	
+	private void markUpToDate(string packageId) {
+		logTrace("markUpToDate(%s)", packageId);
+		Json create(Json json, string object) {
+			auto d = object in json;
+			if(d is null) {
+				Json[string] o;
+				json[object] = o;
+			}
+			return json[object];
+		}
+		create(m_json, "vpm");
+		create(m_json["vpm"], "lastUpdate");
+		m_json["vpm"]["lastUpdate"][packageId] = Json( Clock.currTime().toISOExtString() );
+		
+		writeVpmJson();
+	}
+	
+	private void writeVpmJson() {
+		// don't bother to write an empty file
+		if( m_json.length == 0 ) return;
+
+		try {
+			logTrace("writeVpmJson");
+			auto dstFile = openFile((m_root~"vpm.json").toString(), FileMode.CreateTrunc);
+			scope(exit) dstFile.close();
+			Appender!string js;
+			toPrettyJson(js, m_json);
+			dstFile.write( js.data );
+		} catch( Exception e ){
+			logWarn("Could not write vpm.json.");
+		}
+	}
 }
 
 /// The default supplier for packages, which is the registry
@@ -321,23 +404,9 @@ class Vpm {
 		m_app = new Application(root);
 	}
 	
-	/// Creates the deps.txt file, which is used by vibe to execute
-	/// the application.
-	void createDepsTxt() {
-		string ipaths(bool t) { 
-			string ret;
-			foreach(s; m_app.includePaths(t)) {
-				ret ~= (t?"-J":"-I")~s~"\r\n";
-			}
-			return ret;
-		}
-		string source = ipaths(false);
-		string views = ipaths(true);
-		auto file = openFile("deps.txt", FileMode.CreateTrunc);
-		scope(exit) file.close();
-		string deps = source~views;
-		file.write(cast(ubyte[])deps);
-	}
+	/// Returns a list of flags which the application needs to be compiled
+	/// properly.
+	@property string[] dflags() { return m_app.dflags; }
 	
 	/// Lists all installed modules
 	void list() {
