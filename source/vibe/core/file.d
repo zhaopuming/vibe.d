@@ -15,7 +15,9 @@ import vibe.core.log;
 
 import std.conv;
 import std.c.stdio;
+import std.datetime;
 import std.file;
+import std.path;
 import std.string;
 
 
@@ -52,7 +54,7 @@ void moveFile(Path from, Path to)
 {
 	moveFile(from.toNativeString(), to.toNativeString());
 }
-//
+/// ditto
 void moveFile(string from, string to)
 {
 	std.file.rename(from, to);
@@ -65,7 +67,7 @@ void removeFile(Path path)
 {
 	removeFile(path.toNativeString());
 }
-
+/// ditto
 void removeFile(string path) {
 	std.file.remove(path);
 }
@@ -76,8 +78,72 @@ void removeFile(string path) {
 bool existsFile(Path path) {
 	return existsFile(path.toNativeString());
 }
-
+/// ditto
 bool existsFile(string path)
 {
 	return std.file.exists(path);
+}
+
+/** Stores information about the specified file/directory into 'info'
+
+	Returns false if the file does not exist.
+*/
+FileInfo getFileInfo(Path path)
+{
+	auto ent = std.file.dirEntry(path.toNativeString());
+	return makeFileInfo(ent);
+}
+/// ditto
+FileInfo getFileInfo(string path)
+{
+	return getFileInfo(Path(path));
+}
+
+/**
+	Creates a new directory.
+*/
+void createDirectory(Path path)
+{
+	mkdir(path.toNativeString());
+}
+/// ditto
+void createDirectory(string path)
+{
+	createDirectory(Path(path));
+}
+
+/** Enumerates all files in the specified directory. */
+void listDirectory(Path path, bool delegate(FileInfo info) del)
+{
+	foreach( DirEntry ent; dirEntries(path.toNativeString(), SpanMode.shallow) )
+		if( !del(makeFileInfo(ent)) )
+			break;
+}
+/// ditto
+void listDirectory(string path, bool delegate(FileInfo info) del)
+{
+	listDirectory(Path(path), del);
+}
+
+
+struct FileInfo {
+	string name;
+	ulong size;
+	SysTime timeModified;
+	SysTime timeCreated;
+	bool isSymlink;
+	bool isDirectory;
+}
+
+private FileInfo makeFileInfo(DirEntry ent)
+{
+	FileInfo ret;
+	ret.name = baseName(ent.name);
+	ret.size = ent.size;
+	ret.timeModified = ent.timeLastModified;
+	version(Windows) ret.timeCreated = ent.timeCreated;
+	else ret.timeCreated = ent.timeLastModified;
+	ret.isSymlink = ent.isSymlink;
+	ret.isDirectory = ent.isDir;
+	return ret;
 }

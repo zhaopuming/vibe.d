@@ -24,6 +24,7 @@ import vibe.stream.ssl;
 import vibe.stream.zlib;
 import vibe.templ.diet;
 import vibe.textfilter.urlencode;
+import vibe.utils.memory;
 import vibe.utils.string;
 import vibe.core.file;
 
@@ -35,6 +36,7 @@ import std.exception;
 import std.format;
 import std.functional;
 import std.string;
+import std.typecons;
 import std.uri;
 public import std.variant;
 
@@ -109,6 +111,11 @@ void listenHttp(HttpServerSettings settings, IHttpServerRequestHandler request_h
 */
 void listenHttpPlain(HttpServerSettings settings, HttpServerRequestDelegate request_handler)
 {
+	static void doListen(HttpServerSettings settings, HTTPServerListener listener, string addr)
+	{
+		listenTcp(settings.port, (TcpConnection conn){ handleHttpConnection(conn, listener); }, addr);
+	}
+
 	// Check for every bind address/port, if a new listening socket needs to be created and
 	// check for conflicting servers
 	foreach( addr; settings.bindAddresses ){
@@ -133,7 +140,7 @@ void listenHttpPlain(HttpServerSettings settings, HttpServerRequestDelegate requ
 		if( !found_listener ){
 			auto listener = HTTPServerListener(addr, settings.port, settings.sslCertFile, settings.sslKeyFile);
 			g_listeners ~= listener;
-			listenTcp(settings.port, (TcpConnection conn){ handleHttpConnection(conn, listener); }, addr);
+			doListen(settings, listener, addr); // DMD BUG 2043
 		}
 	}
 }
@@ -332,9 +339,9 @@ class HttpServerSettings {
 
 	/*
 		Log format using Apache custom log format directives. E.g. NCSA combined:
-		"%h - %u %t \"%r\" %s %b \"%{Referer}i\" \"%{User-agent}i\""
+		"%h - %u %t \"%r\" %s %b \"%{Referer}i\" \"%{User-Agent}i\""
 	*/
-	string accessLogFormat = "%h - %u %t \"%r\" %s %b \"%{Referer}i\" \"%{User-agent}i\"";
+	string accessLogFormat = "%h - %u %t \"%r\" %s %b \"%{Referer}i\" \"%{User-Agent}i\"";
 	string accessLogFile = "";
 	bool accessLogToConsole = false;
 
@@ -351,15 +358,17 @@ class HttpServerSettings {
 }
 
 
-/// Throwing this exception from within a request handler will produce a matching error page.
-class HttpServerError : Exception {
+/**
+	Throwing this exception from within a request handler will produce a matching error page.
+*/
+class HttpStatusException : Exception {
 	private {
 		int m_status;
 	}
 
-	this(int status, string message = null)
+	this(int status, string message = null, Throwable next = null, string file = __FILE__, int line = __LINE__)
 	{
-		super(message ? message : httpStatusText(status));
+		super(message ? message : httpStatusText(status), file, line, next);
 		m_status = status;
 	}
 	
@@ -407,7 +416,7 @@ final class HttpServerRequest : HttpRequest {
 		SysTime m_timeCreated;
 	}
 
-	private this()
+	this()
 	{
 		m_timeCreated = Clock.currTime().toUTC();
 	}
@@ -436,20 +445,24 @@ final class HttpServerResponse : HttpResponse {
 	private {
 		Stream m_conn;
 		OutputStream m_bodyWriter;
-		ChunkedOutputStream m_chunkedBodyWriter;
-		CountingOutputStream m_countingWriter;
+		Allocator m_requestAlloc;
+		FreeListRef!ChunkedOutputStream m_chunkedBodyWriter;
+		FreeListRef!CountingOutputStream m_countingWriter;
+		FreeListRef!GzipOutputStream m_gzipOutputStream;
+		FreeListRef!DeflateOutputStream m_deflateOutputStream;
 		HttpServerSettings m_settings;
 		Session m_session;
 		bool m_headerWritten = false;
 		bool m_isHeadResponse = false;
 		SysTime m_timeFinalized;
 	}
-	
-	private this(Stream conn, HttpServerSettings settings)
+
+	this(Stream conn, HttpServerSettings settings, Allocator req_alloc)
 	{
 		m_conn = conn;
-		m_countingWriter = new CountingOutputStream(conn);
+		m_countingWriter = FreeListRef!CountingOutputStream(conn);
 		m_settings = settings;
+		m_requestAlloc = req_alloc;
 	}
 	
 	@property bool headerWritten() const { return m_headerWritten; }
@@ -460,7 +473,7 @@ final class HttpServerResponse : HttpResponse {
 	void writeBody(in ubyte[] data, string content_type = null)
 	{
 		if( content_type ) headers["Content-Type"] = content_type;
-		headers["Content-Length"] = to!string(data.length);
+		headers["Content-Length"] = formatAlloc(m_requestAlloc, "%d", data.length);
 		bodyWriter.write(data);
 	}
 
@@ -523,15 +536,17 @@ final class HttpServerResponse : HttpResponse {
 		} else {
 			headers["Transfer-Encoding"] = "chunked";
 			writeHeader();
-			m_chunkedBodyWriter = new ChunkedOutputStream(m_countingWriter);
+			m_chunkedBodyWriter = FreeListRef!ChunkedOutputStream(m_countingWriter);
 			m_bodyWriter = m_chunkedBodyWriter;
 		}
 
 		if( auto pce = "Content-Encoding" in headers ){
 			if( *pce == "gzip" ){
-				m_bodyWriter = new GzipOutputStream(m_bodyWriter);
+				m_gzipOutputStream = FreeListRef!GzipOutputStream(m_bodyWriter);
+				m_bodyWriter = m_gzipOutputStream; 
 			} else if( *pce == "deflate" ){
-				m_bodyWriter = new DeflateOutputStream(m_bodyWriter);
+				m_deflateOutputStream = FreeListRef!DeflateOutputStream(m_bodyWriter);
+				m_bodyWriter = m_deflateOutputStream;
 			} else {
 				logWarn("Unsupported Content-Encoding set in response: '"~*pce~"'");
 			}
@@ -657,8 +672,15 @@ final class HttpServerResponse : HttpResponse {
 			app.put("\r\n");
 		}
 
+		// NOTE: AA.length is very slow so this helper function is used to determine if an AA is empty.
+		static bool empty(AA)(AA aa)
+		{
+			foreach( _; aa ) return false;
+			return true;
+		}
+
 		// write cookies
-		if ( cookies.length > 0 ) {
+		if( !empty(cookies) ) {
 			foreach( n, cookie; this.cookies ) {
 				app.put("Set-Cookie: ");
 				app.put(n);
@@ -723,7 +745,7 @@ private class LimitedHttpInputStream : LimitedInputStream {
 		super(stream, byte_limit, silent_limit);
 	}
 	override void onSizeLimitReached() {
-		throw new HttpServerError(HttpStatus.RequestEntityTooLarge);
+		throw new HttpStatusException(HttpStatus.RequestEntityTooLarge);
 	}
 }
 
@@ -756,7 +778,7 @@ private class TimeoutHttpInputStream : InputStream {
 	private void checkTimeout() {
 		SysTime curr = Clock.currTime();
 		auto diff = curr - m_timeref;
-		if( diff > m_timeleft ) throw new HttpServerError(HttpStatus.RequestTimeout);
+		if( diff > m_timeleft ) throw new HttpStatusException(HttpStatus.RequestTimeout);
 		m_timeleft -= diff;
 		m_timeref = curr;
 	}
@@ -777,31 +799,122 @@ private {
 /// private
 private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen_info)
 {
-	NullOutputStream nullWriter = new NullOutputStream();
-	SslContext ssl_ctx;
+	FreeListRef!SslContext ssl_ctx;
+	FreeListRef!SslContext ssl_context;
 	if( listen_info.sslCertFile.length || listen_info.sslKeyFile.length ){
 		logDebug("Creating SSL context...");
 		assert(listen_info.sslCertFile.length && listen_info.sslKeyFile.length);
-		ssl_ctx = new SslContext(listen_info.sslCertFile, listen_info.sslKeyFile);
+		ssl_ctx = FreeListRef!SslContext(listen_info.sslCertFile, listen_info.sslKeyFile);
 		logDebug("... done");
 	}
 
 	Stream conn;
-	HttpServerRequest req;
+	FreeListRef!SslStream ssl_stream;
 
 	// If this is a HTTPS server, initiate SSL
 	if( ssl_ctx ){
 		logTrace("accept ssl");
-		conn = new SslStream(conn_, ssl_ctx, SslStreamState.Accepting);
+		ssl_stream = FreeListRef!SslStream(conn_, ssl_ctx, SslStreamState.Accepting);
+		conn = ssl_stream;
 	} else conn = conn_;
 
+	bool persistent;
 	do {
-		// Default to the first virtual host for this listener
 		HttpServerSettings settings;
-		HttpServerRequestDelegate request_task;
-		HTTPServerContext context;
+		persistent = handleRequest(conn, conn_.peerAddress, listen_info, settings);
+
+		// wait for another possible request on a keep-alive connection
+		if( persistent && !conn_.waitForData(settings.keepAliveTimeout) ) {
+			logDebug("persistent connection timeout!");
+			break;
+		}
+	} while( persistent && conn_.connected );
+}
+
+private bool handleRequest(Stream conn, string peer_address, HTTPServerListener listen_info, ref HttpServerSettings settings)
+{
+	auto base_allocator = scoped!AutoFreeListAllocator();
+	auto request_allocator = scoped!PoolAllocator(1024, base_allocator.Scoped_payload);
+
+	// some instances that live only while the request is running
+	FreeListRef!NullOutputStream nullWriter = FreeListRef!NullOutputStream();
+	FreeListRef!HttpServerRequest req = FreeListRef!HttpServerRequest();
+	FreeListRef!TimeoutHttpInputStream timeout_http_input_stream;
+	FreeListRef!LimitedHttpInputStream limited_http_input_stream;
+	FreeListRef!ChunkedInputStream chunked_input_stream;
+
+	// Default to the first virtual host for this listener
+	HttpServerRequestDelegate request_task;
+	HTTPServerContext context;
+	foreach( ctx; g_contexts )
+		if( ctx.settings.port == listen_info.bindPort ){
+			bool found = false;
+			foreach( addr; ctx.settings.bindAddresses )
+				if( addr == listen_info.bindAddress )
+					found = true;
+			if( !found ) continue;
+			context = ctx;
+			settings = ctx.settings;
+			request_task = ctx.requestHandler;
+			break;
+		}
+
+	// Create the response object
+	auto res = FreeListRef!HttpServerResponse(conn, settings, request_allocator.Scoped_payload);
+
+	// Error page handler
+	void errorOut(int code, string msg, string debug_msg, Throwable ex){
+		assert(!res.headerWritten);
+
+		// stack traces sometimes contain random bytes - make sure they are replaced
+		debug_msg = sanitizeUTF8(cast(ubyte[])debug_msg);
+
+		res.statusCode = code;
+		if( settings && settings.errorPageHandler ){
+			scope err = new HttpServerErrorInfo;
+			err.code = code;
+			err.message = msg;
+			err.debugMessage = debug_msg;
+			err.exception = ex;
+			settings.errorPageHandler(req, res, err);
+		} else {
+			res.contentType = "text/plain";
+			res.bodyWriter.write(to!string(code) ~ " - " ~ httpStatusText(code) ~ "\n\n" ~ msg ~ "\n\nInternal error information:\n" ~ debug_msg);
+		}
+		assert(res.headerWritten);
+	}
+
+	bool parsed = false;
+	bool keep_alive = false;
+
+	// parse the request
+	try {
+		logTrace("reading request..");
+
+		InputStream reqReader;
+		if( settings.maxRequestTime == dur!"seconds"(0) ) reqReader = conn;
+		else {
+			timeout_http_input_stream = FreeListRef!TimeoutHttpInputStream(conn, settings.maxRequestTime);
+			reqReader = timeout_http_input_stream;
+		}
+
+		// basic request parsing
+		req = parseRequest(reqReader, request_allocator);
+		req.peer = peer_address;
+		logTrace("Got request header.");
+
+		//handle Expect-Header
+		if( auto pv = "Expect" in req.headers) {
+			if( *pv == "100-continue" ) {
+				logTrace("sending 100 continue");
+				conn.write("HTTP/1.1 100 Continue\r\n");
+			}
+		}
+
+		// find the matching virtual host
 		foreach( ctx; g_contexts )
-			if( ctx.settings.port == listen_info.bindPort ){
+			if( ctx.settings.hostName == req.host ){
+				if( ctx.settings.port != listen_info.bindPort ) continue;
 				bool found = false;
 				foreach( addr; ctx.settings.bindAddresses )
 					if( addr == listen_info.bindAddress )
@@ -812,220 +925,151 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 				request_task = ctx.requestHandler;
 				break;
 			}
+		res.m_settings = settings;
 
-		// Create the response object
-		scope res = new HttpServerResponse(conn, settings);
-
-		// Error page handler
-		void errorOut(int code, string msg, string debug_msg, Throwable ex){
-			assert(!res.headerWritten);
-
-			// stack traces sometimes contain random bytes - make sure they are replaced
-			debug_msg = sanitizeUTF8(cast(ubyte[])debug_msg);
-
-			res.statusCode = code;
-			if( settings && settings.errorPageHandler ){
-				scope err = new HttpServerErrorInfo;
-				err.code = code;
-				err.message = msg;
-				err.debugMessage = debug_msg;
-				err.exception = ex;
-				settings.errorPageHandler(req, res, err);
-			} else {
-				res.contentType = "text/plain";
-				res.bodyWriter.write(to!string(code) ~ " - " ~ httpStatusText(code) ~ "\n\n" ~ msg ~ "\n\nInternal error information:\n" ~ debug_msg);
-			}
-			assert(res.headerWritten);
-		}
-
-		bool parsed = false;
-
-		// parse the request
-		try {
-			logTrace("reading request..");
-
-			InputStream reqReader;
-			if( settings.maxRequestTime == dur!"seconds"(0) ) reqReader = conn;
-			else reqReader = new TimeoutHttpInputStream(conn, settings.maxRequestTime);
-
-			// basic request parsing
-			req = parseRequest(reqReader);
-			req.peer = conn_.peerAddress;
-			logTrace("Got request header.");
-
-			//handle Expect-Header
-			if( auto pv = "Expect" in req.headers) {
-				if( *pv == "100-continue" ) {
-					logTrace("sending 100 continue");
-					conn.write("HTTP/1.1 100 Continue\r\n");
-				}
-			}
-
-			// find the matching virtual host
-			foreach( ctx; g_contexts )
-				if( ctx.settings.hostName == req.host ){
-					if( ctx.settings.port != listen_info.bindPort ) continue;
-					bool found = false;
-					foreach( addr; ctx.settings.bindAddresses )
-						if( addr == listen_info.bindAddress )
-							found = true;
-					if( !found ) continue;
-					context = ctx;
-					settings = ctx.settings;
-					request_task = ctx.requestHandler;
-					break;
-				}
-			res.m_settings = settings;
-
-			// setup compressed output
-			if( auto pae = "Accept-Encoding" in req.headers ){
-				if( countUntil(*pae, "gzip") >= 0 ){
-					res.headers["Content-Encoding"] = "gzip";
-				} else if( countUntil(*pae, "deflate") >= 0 ){
-					res.headers["Content-Encoding"] = "deflate";
-				}
-			}
-
-			// limit request size
-			if( auto pcl = "Content-Length" in req.headers ) {
-				string v = *pcl;
-				auto contentLength = parse!ulong(v); // DMDBUG: to! thinks there is a H in the string
-				enforce(v.length == 0, "Invalid content-length");
-				enforce(settings.maxRequestSize <= 0 || contentLength <= settings.maxRequestSize, "Request size too big");
-				req.bodyReader = new LimitedHttpInputStream(reqReader, contentLength);
-			} else {
-				if( auto pt = "Transfer-Encoding" in req.headers ){
-					enforce(*pt == "chunked");
-					req.bodyReader = new LimitedHttpInputStream(new ChunkedInputStream(reqReader), settings.maxRequestSize, true);
-				} else {
-					auto pc = "Connection" in req.headers;
-					if( pc && *pc == "close" )
-						req.bodyReader = new LimitedHttpInputStream(reqReader, settings.maxRequestSize, true);
-					else
-						req.bodyReader = new LimitedHttpInputStream(reqReader, 0);
-				}
-			}
-
-			// Url parsing if desired
-			if( settings.options & HttpServerOption.ParseURL ){
-				auto url = Url.parse(req.url);
-				req.path = url.pathString;
-				req.queryString = url.queryString;
-				req.username = url.username;
-				req.password = url.password;
-			}
-
-			// query string parsing if desired
-			if( settings.options & HttpServerOption.ParseQueryString ){
-				if( !(settings.options & HttpServerOption.ParseURL) )
-					logWarn("Query string parsing requested but URL parsing is disabled!");
-				parseUrlEncodedForm(req.queryString, req.query);
-			}
-
-			// cookie parsing if desired
-			if( settings.options & HttpServerOption.ParseCookies ){
-				auto pv = "cookie" in req.headers;
-				if ( pv ) parseCookies(*pv, req.cookies);
-			}
-
-			// lookup the session
-			if ( settings.sessionStore ) {
-				auto pv = settings.sessionIdCookie in req.cookies;
-				if (pv && *pv != "") {
-					req.session = settings.sessionStore.open(*pv);
-					res.m_session = req.session;
-				}
-			}
-
-			if( settings.options & HttpServerOption.ParseFormBody ){
-				auto ptype = "Content-Type" in req.headers;				
-				if( ptype ) parseFormData(req.form, req.files, *ptype, req.bodyReader);
-			}
-
-			if( settings.options & HttpServerOption.ParseJsonBody ){
-				auto ptype = "Content-Type" in req.headers;				
-				if( ptype && *ptype == "application/json" ){
-					auto bodyStr = cast(string)req.bodyReader.readAll();
-					req.json = parseJson(bodyStr);
-				}
-			}
-
-			// write default headers
-			if( req.method == "HEAD" ) res.m_isHeadResponse = true;
-			if( settings.serverString.length )
-				res.headers["Server"] = settings.serverString;
-			res.headers["Date"] = toRFC822DateTimeString(Clock.currTime().toUTC());
-			if( req.persistent ) res.headers["Keep-Alive"] = "timeout="~to!string(settings.keepAliveTimeout.total!"seconds"());
-
-			// finished parsing the request
-			parsed = true;
-
-			// handle the request
-			logTrace("handle request (body %d)", req.bodyReader.leastSize);
-			res.httpVersion = req.httpVersion;
-			request_task(req, res);
-		} catch(HttpServerError err) {
-			logDebug("http error thrown: %s", err.toString());
-			if ( !res.headerWritten ) errorOut(err.status, err.msg, err.toString(), err);
-			else logError("HttpServerError after page has been written: %s", err.toString());
-			logDebug("Exception while handling request: %s", err.toString());
-			if ( !parsed || justifiesConnectionClose(err.status) ) {
-				conn_.close();
-				break;
-			}
-		} catch (Throwable e) {
-			logDebug("Exception while parsing request: %s", e.toString());
-			if( !res.headerWritten ) errorOut(parsed ? HttpStatus.InternalServerError :
-				HttpStatus.BadRequest, "Invalid request format.", e.toString(), e);
-			else logError("Error after page has been written: %s", e.msg);
-			logDebug("Exception while handling request: %s", e.toString());
-			if ( !parsed ) {
-				conn_.close();
-				break;
+		// setup compressed output
+		if( auto pae = "Accept-Encoding" in req.headers ){
+			if( countUntil(*pae, "gzip") >= 0 ){
+				res.headers["Content-Encoding"] = "gzip";
+			} else if( countUntil(*pae, "deflate") >= 0 ){
+				res.headers["Content-Encoding"] = "deflate";
 			}
 		}
+
+		// limit request size
+		if( auto pcl = "Content-Length" in req.headers ) {
+			string v = *pcl;
+			auto contentLength = parse!ulong(v); // DMDBUG: to! thinks there is a H in the string
+			enforce(v.length == 0, "Invalid content-length");
+			enforce(settings.maxRequestSize <= 0 || contentLength <= settings.maxRequestSize, "Request size too big");
+			limited_http_input_stream = FreeListRef!LimitedHttpInputStream(reqReader, contentLength);
+		} else if( auto pt = "Transfer-Encoding" in req.headers ){
+			enforce(*pt == "chunked");
+			chunked_input_stream = FreeListRef!ChunkedInputStream(reqReader);
+			limited_http_input_stream = FreeListRef!LimitedHttpInputStream(chunked_input_stream, settings.maxRequestSize, true);
+		} else {
+			auto pc = "Connection" in req.headers;
+			if( pc && *pc == "close" )
+				limited_http_input_stream = FreeListRef!LimitedHttpInputStream(reqReader, settings.maxRequestSize, true);
+			else
+				limited_http_input_stream = FreeListRef!LimitedHttpInputStream(reqReader, 0);
+		}
+		req.bodyReader = limited_http_input_stream;
+
+		// Url parsing if desired
+		if( settings.options & HttpServerOption.ParseURL ){
+			auto url = Url.parse(req.url);
+			req.path = url.pathString;
+			req.queryString = url.queryString;
+			req.username = url.username;
+			req.password = url.password;
+		}
+
+		// query string parsing if desired
+		if( settings.options & HttpServerOption.ParseQueryString ){
+			if( !(settings.options & HttpServerOption.ParseURL) )
+				logWarn("Query string parsing requested but URL parsing is disabled!");
+			parseUrlEncodedForm(req.queryString, req.query);
+		}
+
+		// cookie parsing if desired
+		if( settings.options & HttpServerOption.ParseCookies ){
+			auto pv = "cookie" in req.headers;
+			if ( pv ) parseCookies(*pv, req.cookies);
+		}
+
+		// lookup the session
+		if ( settings.sessionStore ) {
+			auto pv = settings.sessionIdCookie in req.cookies;
+			if (pv && *pv != "") {
+				req.session = settings.sessionStore.open(*pv);
+				res.m_session = req.session;
+			}
+		}
+
+		if( settings.options & HttpServerOption.ParseFormBody ){
+			auto ptype = "Content-Type" in req.headers;				
+			if( ptype ) parseFormData(req.form, req.files, *ptype, req.bodyReader);
+		}
+
+		if( settings.options & HttpServerOption.ParseJsonBody ){
+			auto ptype = "Content-Type" in req.headers;				
+			if( ptype && *ptype == "application/json" ){
+				auto bodyStr = cast(string)req.bodyReader.readAll();
+				req.json = parseJson(bodyStr);
+			}
+		}
+
+		// write default headers
+		if( req.method == HttpMethod.HEAD ) res.m_isHeadResponse = true;
+		if( settings.serverString.length )
+			res.headers["Server"] = settings.serverString;
+		res.headers["Date"] = toRFC822DateTimeString(Clock.currTime().toUTC());
+		if( req.persistent ) res.headers["Keep-Alive"] = formatAlloc(request_allocator, "timeout=%d", settings.keepAliveTimeout.total!"seconds"());
+
+		// finished parsing the request
+		parsed = true;
+		keep_alive = req.persistent;
+
+		// handle the request
+		logTrace("handle request (body %d)", req.bodyReader.leastSize);
+		res.httpVersion = req.httpVersion;
+		request_task(req, res);
 
 		// if no one has written anything, return 404
-		if( !res.headerWritten ) errorOut(HttpStatus.NotFound, "Not found.", "", null);
+		if( !res.headerWritten )
+			throw new HttpStatusException(HttpStatus.NotFound);
+	} catch(HttpStatusException err) {
+		logDebug("http error thrown: %s", err.toString());
+		if ( !res.headerWritten ) errorOut(err.status, err.msg, err.toString(), err);
+		else logError("HttpStatusException after page has been written: %s", err.toString());
+		logDebug("Exception while handling request: %s", err.toString());
+		if ( !parsed || justifiesConnectionClose(err.status) )
+			keep_alive = false;
+	} catch (Throwable e) {
+		logDebug("Exception while parsing request: %s", e.toString());
+		auto status = parsed ? HttpStatus.InternalServerError : HttpStatus.BadRequest;
+		if( !res.headerWritten ) errorOut(status, httpStatusText(status), e.toString(), e);
+		else logError("Error after page has been written: %s", e.msg);
+		logDebug("Exception while handling request: %s", e.toString());
+		if ( !parsed )
+			keep_alive = false;
+	}
 
-		nullWriter.write(req.bodyReader);
+	nullWriter.write(req.bodyReader);
 
-		// finalize (e.g. for chunked encoding)
-		res.finalize();
+	// finalize (e.g. for chunked encoding)
+	res.finalize();
 
-		foreach( k, v ; req.files ){
-			if( existsFile(v.tempPath) ) {
-				removeFile(v.tempPath); 
-				logDebug("Deleted upload tempfile %s", v.tempPath.toString()); 
-			}
+	foreach( k, v ; req.files ){
+		if( existsFile(v.tempPath) ) {
+			removeFile(v.tempPath); 
+			logDebug("Deleted upload tempfile %s", v.tempPath.toString()); 
 		}
+	}
 
-		// log the request to access log
-		foreach( log; context.loggers )
-			log.log(req, res);
+	// log the request to access log
+	foreach( log; context.loggers )
+		log.log(req, res);
 
-		// wait for another possible request on a keep-alive connection
-		if( req.persistent && !conn_.waitForData(settings.keepAliveTimeout) ) {
-			logDebug("persistent connection timeout!");
-			break;
-		}
-	} while( req.persistent && conn_.connected );
+	return keep_alive;
 }
 
-private HttpServerRequest parseRequest(InputStream conn)
+
+private FreeListRef!HttpServerRequest parseRequest(InputStream conn, Allocator alloc)
 {
-	auto req = new HttpServerRequest;
-	auto stream = new LimitedHttpInputStream(conn, MaxHttpRequestHeaderSize);
+	auto req = FreeListRef!HttpServerRequest();
+	auto stream = FreeListRef!LimitedHttpInputStream(conn, MaxHttpRequestHeaderSize);
 
 	logTrace("HTTP server reading status line");
-	auto reqln = cast(string)stream.readLine(MaxHttpHeaderLineLength);
+	auto reqln = cast(string)stream.readLine(MaxHttpHeaderLineLength, "\r\n", alloc);
 	logTrace("req: %s", reqln);
 	
 	//Method
 	auto pos = reqln.indexOf(' ');
 	enforce( pos >= 0, "invalid request method" );
 
-	req.method = reqln[0 .. pos];
+	req.method = httpMethodFromString(reqln[0 .. pos]);
 	reqln = reqln[pos+1 .. $];
 	//Path
 	pos = reqln.indexOf(' ');
@@ -1037,7 +1081,7 @@ private HttpServerRequest parseRequest(InputStream conn)
 	req.httpVersion = parseHttpVersion(reqln);
 	
 	//headers
-	parseRfc5322Header(stream, req.headers, MaxHttpHeaderLineLength);
+	parseRfc5322Header(stream, req.headers, MaxHttpHeaderLineLength, alloc);
 
 	return req;
 }
@@ -1055,4 +1099,11 @@ private void parseCookies(string str, ref string[string] cookies)
 		cookies[name] = urlDecode(value);
 		str = idx < str.length ? str[idx+1 .. $] : null;
 	}
+}
+
+private string formatAlloc(ARGS...)(Allocator alloc, string fmt, ARGS args)
+{
+	auto app = AllocAppender!string(alloc);
+	formattedWrite(&app, fmt, args);
+	return app.data;
 }

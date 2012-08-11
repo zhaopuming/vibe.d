@@ -7,12 +7,15 @@
 */
 module vibe.core.drivers.libev;
 
+version(VibeLibevDriver)
+{
+
 import vibe.core.core;
 import vibe.core.driver;
 import vibe.core.drivers.threadedfile;
 import vibe.core.log;
 
-import intf.libev;
+import deimos.ev;
 
 import std.algorithm : min;
 import std.array;
@@ -60,16 +63,26 @@ class LibevDriver : EventDriver {
 
 	int runEventLoop()
 	{
-		while(!m_break)
+		while(!m_break){
 			ev_run(m_loop, EVRUN_ONCE);
+			m_core.notifyIdle();
+		}
 		m_break = false;
 		logInfo("Event loop exit", m_break);
 		return 0;
 	}
 	
-	int processEvents()
+	int runEventLoopOnce()
 	{
 		ev_run(m_loop, EVRUN_ONCE);
+		m_core.notifyIdle();
+		return 0;
+	}
+
+	int processEvents()
+	{
+		ev_run(m_loop, EVRUN_NOWAIT);
+		m_core.notifyIdle();
 		return 0;
 	}
 	
@@ -196,6 +209,8 @@ class LibevTcpConnection : TcpConnection {
 		ev_io* m_writeWatcher;
 		int m_eventsExpected = 0;
 		Appender!(ubyte[]) m_writeBuffer;
+		bool m_tcpNoDelay = false;
+		Duration m_readTimeout;
 	}
 	
 	this(LibevDriver driver, int fd, ev_io* read_watcher, ev_io* write_watcher)
@@ -210,9 +225,22 @@ class LibevTcpConnection : TcpConnection {
 	
 	@property void tcpNoDelay(bool enabled)
 	{
+		m_tcpNoDelay = enabled;
 		ubyte opt = enabled;
 		setsockopt(m_socket, IPPROTO_TCP, TCP_NODELAY, &opt, opt.sizeof);
 	}
+	@property bool tcpNoDelay() const { return m_tcpNoDelay; }
+
+	@property void readTimeout(Duration v)
+	{
+		m_readTimeout = v;
+		if( v == dur!"seconds"(0) ){
+			// ...
+		} else {
+			assert(false);
+		}
+	}
+	@property Duration readTimeout() const { return m_readTimeout; }
 	
 	void close()
 	{
@@ -518,3 +546,5 @@ private void setNonBlocking(int fd)
 		fcntl(fd, F_SETFL, flags);
 	}
 }
+
+} // version(VibeLibevDriver)

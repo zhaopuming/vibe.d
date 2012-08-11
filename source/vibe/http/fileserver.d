@@ -22,6 +22,7 @@ import std.string;
 class HttpFileServerSettings {
 	string serverPathPrefix = "/";
 	long maxAge = 60*60*24*30; // 30 days
+	bool failIfNotFound = false;
 
 	this() {}
 
@@ -60,11 +61,16 @@ HttpServerRequestDelegate serveStaticFiles(string local_path, HttpFileServerSett
 
 		string path = (lpath ~ rpath).toNativeString();
 
+		// return if the file does not exist
+		if( !exists(path) ){
+			if( settings.failIfNotFound ) throw new HttpStatusException(HttpStatus.NotFound);
+			else return;
+		}
+
 		DirEntry dirent;
 		try dirent = dirEntry(path);
 		catch(FileException){
-			// return if the file does not exist
-			return;
+			throw new HttpStatusException(HttpStatus.InternalServerError, "Failed to get information for the file due to a file system error.");
 		}
 
 		auto lastModified = toRFC822DateTimeString(dirent.timeLastModified.toUTC());

@@ -13,6 +13,7 @@ import vibe.http.client;
 import vibe.http.router;
 import vibe.inet.url;
 import vibe.textfilter.urlencode;
+import vibe.utils.string;
 
 import std.array;
 import std.conv;
@@ -125,15 +126,18 @@ import std.traits;
 void registerRestInterface(T)(UrlRouter router, T instance, string url_prefix = "/",
 		MethodStyle style = MethodStyle.LowerUnderscored)
 {
-	string url(string name, size_t nskip){
-		return url_prefix ~ adjustMethodStyle(name[nskip .. $], style);
+	void addRoute(HttpMethod http_verb, string url, HttpServerRequestDelegate handler)
+	{
+		router.addRoute(http_verb, url, handler);
+		logDebug("REST route: %s %s", http_verb, url);
 	}
 
 	foreach( method; __traits(allMembers, T) ){
 		foreach( overload; MemberFunctionsTuple!(T, method) ){
 			alias ReturnType!overload RetType;
 			auto param_names = parameterNames!(typeof(&overload))();
-			string http_verb, rest_name;
+			HttpMethod http_verb;
+			string rest_name;
 			getRestMethodName!(typeof(&overload))(method, http_verb, rest_name);
 			string rest_name_adj = adjustMethodStyle(rest_name, style);
 			static if( is(RetType == interface) ){
@@ -143,10 +147,12 @@ void registerRestInterface(T)(UrlRouter router, T instance, string url_prefix = 
 				auto handler = jsonMethodHandler!(T, method, typeof(&overload))(instance);
 				string id_supplement;
 				size_t skip = 0;
-				if( param_names.length && param_names[0] == "id" )
-					id_supplement = ":id" ~ (rest_name.length ? "/" : "");
-				router.addRoute(http_verb, url_prefix ~ id_supplement ~ rest_name_adj, handler);
-				logDebug("REST route: %s %s", http_verb, url_prefix ~ id_supplement ~ rest_name_adj);
+				string url;
+				if( param_names.length && param_names[0] == "id" ){
+					addRoute(http_verb, url_prefix ~ ":id/" ~ rest_name_adj, handler);
+					if( rest_name_adj.length == 0 )
+						addRoute(http_verb, url_prefix ~ ":id", handler);
+				} else addRoute	(http_verb, url_prefix ~ rest_name_adj, handler);
 			}
 		}
 	}
@@ -219,9 +225,11 @@ void registerFormInterface(I)(UrlRouter router, I instance, string url_prefix,
 */
 class RestInterfaceClient(I) : I
 {
+	alias void delegate(HttpClientRequest req) RequestFilter;
 	private {
 		Url m_baseUrl;
 		MethodStyle m_methodStyle;
+		RequestFilter m_requestFilter;
 	}
 
 	alias I BaseInterface;
@@ -240,6 +248,12 @@ class RestInterfaceClient(I) : I
 		mixin(generateRestInterfaceSubInterfaceInstances!I);
 	}
 
+	@property RequestFilter requestFilter() { return m_requestFilter; }
+	@property void requestFilter(RequestFilter v) {
+		m_requestFilter = v;
+		mixin(generateRestInterfaceSubInterfaceRequestFilter!I);
+	}
+
 	//pragma(msg, generateRestInterfaceSubInterfaces!(I)());
 	mixin(generateRestInterfaceSubInterfaces!(I));
 
@@ -250,6 +264,11 @@ class RestInterfaceClient(I) : I
 	const {
 		Url url = m_baseUrl;
 		if( name.length ) url ~= Path(name);
+		else if( !url.path.endsWithSlash ){
+			auto p = url.path;
+			p.endsWithSlash = true;
+			url.path = p;
+		}
 
 		if( (verb == "GET" || verb == "HEAD") && params.length > 0 ){
 			auto queryString = appender!string();
@@ -267,14 +286,18 @@ class RestInterfaceClient(I) : I
 		}
 
 		auto res = requestHttp(url, (req){
-				req.method = verb;
+				req.method = httpMethodFromString(verb);
+				if( m_requestFilter ) m_requestFilter(req);
 				if( verb != "GET" && verb != "HEAD" )
 					req.writeJsonBody(params);
 			});
 		auto ret = res.readJson();
 		logDebug("REST call: %s %s -> %d, %s", verb, url.toString(), res.statusCode, ret.toString());
-		if( res.statusCode != HttpStatus.OK )
-			throw new Exception("REST API returned an error"); // TODO: better message!
+		if( res.statusCode != HttpStatus.OK ){
+			if( ret.type == Json.Type.Object && ret.statusMessage.type == Json.Type.String )
+				throw new Exception(ret.statusMessage.get!string);
+			else throw new Exception(httpStatusText(res.statusCode));
+		}
 		return ret;
 	}
 }
@@ -344,10 +367,20 @@ private HttpServerRequestDelegate jsonMethodHandler(T, string method, FT)(T inst
 					params[i] = P.fromString(req.params["id"]);
 				else
 					params[i] = to!P(req.params["id"]);
-			} else static if( method == "GET" )
-				deserializeJson(params[i], deserializeJson(req.query[param_names[i]]));
-			else
-				deserializeJson(params[i], jparams[param_names[i]]);
+			} else static if( param_names[i].startsWith("_") ){
+				static if( __traits(compiles, P.fromString("")) )
+					params[i] = P.fromString(req.params[param_names[i][1 .. $]]);
+				else
+					params[i] = to!P(req.params[param_names[i][1 .. $]]);
+			} else {
+				if( req.method == HttpMethod.GET ){
+					logDebug("query %s of %s" ,param_names[i], req.query);
+					deserializeJson(params[i], parseJson(req.query[param_names[i]]));
+				} else {
+					logDebug("%s %s", method, param_names[i]);
+					deserializeJson(params[i], jparams[param_names[i]]);
+				}
+			}
 		}
 
 		try {
@@ -360,8 +393,7 @@ private HttpServerRequestDelegate jsonMethodHandler(T, string method, FT)(T inst
 			}
 		} catch( Exception e ){
 			// TODO: better error description!
-			res.statusCode = HttpStatus.InternalServerError;
-			res.writeBody("Error!");
+			res.writeJsonBody(["statusMessage": e.msg, "statusDebugMessage": sanitizeUTF8(cast(ubyte[])e.toString())], HttpStatus.InternalServerError);
 		}
 	}
 
@@ -419,9 +451,36 @@ private @property string generateRestInterfaceSubInterfaceInstances(I)()
 				if( tps.countUntil(RT.stringof) < 0 ){
 					tps ~= RT.stringof;
 					string implname = RT.stringof~"Impl";
-					string http_verb, rest_name;
+					HttpMethod http_verb;
+					string rest_name;
 					getRestMethodName!FT(method, http_verb, rest_name);
 					ret ~= "m_"~implname~" = new "~implname~"(m_baseUrl~PathEntry(\""~rest_name~"\"), m_methodStyle);\n";
+				}
+			}
+		}
+	}
+	return ret;
+}
+
+/// private
+private @property string generateRestInterfaceSubInterfaceRequestFilter(I)()
+{
+	string ret;
+	string[] tps;
+	foreach( method; __traits(allMembers, I) ){
+		foreach( overload; MemberFunctionsTuple!(I, method) ){
+			alias typeof(&overload) FT;
+			alias ParameterTypeTuple!FT PTypes;
+			alias ReturnType!FT RT;
+			static if( is(RT == interface) ){
+				static assert(PTypes.length == 0, "Interface getters may not have parameters.");
+				if( tps.countUntil(RT.stringof) < 0 ){
+					tps ~= RT.stringof;
+					string implname = RT.stringof~"Impl";
+					HttpMethod http_verb;
+					string rest_name;
+					getRestMethodName!FT(method, http_verb, rest_name);
+					ret ~= "m_"~implname~".requestFilter = m_requestFilter;\n";
 				}
 			}
 		}
@@ -441,7 +500,8 @@ private @property string generateRestInterfaceMethods(I)()
 			alias ReturnType!FT RT;
 
 			auto param_names = parameterNames!FT();
-			string http_verb, rest_name;
+			HttpMethod http_verb; 
+			string rest_name;
 			getRestMethodName!FT(method, http_verb, rest_name);
 			ret ~= "override "~getReturnTypeString!(overload)~" "~method~"(";
 			foreach( i, PT; PTypes ){
@@ -461,16 +521,21 @@ private @property string generateRestInterfaceMethods(I)()
 			} else {
 				ret ~= " {\n";
 				ret ~= "\tJson jparams__ = Json.EmptyObject;\n";
+
+				// serialize all parameters
 				string path_supplement;
-				size_t skip = 0;
-				if( param_names.length > 0 && param_names[0] == "id" ){
-					path_supplement = "to!string(id)~\"/\"~";
-					skip = 1;
+				foreach( i, PT; PTypes ){
+					if( i == 0 && param_names[0] == "id" ){
+						path_supplement = "to!string(id)~\"/\"~";
+						continue;
+					}
+					// underscore parameters are sourced from the HttpServerRequest.params map
+					if( param_names[i].startsWith("_") ) continue;
+
+					ret ~= "\tjparams__[\""~param_names[i]~"\"] = serializeToJson("~param_names[i]~");\n";
 				}
-				foreach( i, PT; PTypes )
-					if( i >= skip )
-						ret ~= "\tjparams__[\""~param_names[i]~"\"] = serializeToJson("~param_names[i]~");\n";
-				ret ~= "\tauto jret__ = request(\""~http_verb~"\", "~path_supplement~"adjustMethodStyle(\""~rest_name~"\", m_methodStyle), jparams__);\n";
+
+				ret ~= "\tauto jret__ = request(\""~ httpMethodString(http_verb)~"\", "~path_supplement~"adjustMethodStyle(\""~rest_name~"\", m_methodStyle), jparams__);\n";
 				static if( !is(RT == void) ){
 					ret ~= "\t"~getReturnTypeString!(overload)~" ret__;\n";
 					ret ~= "\tdeserializeJson(ret__, jret__);\n";
@@ -505,70 +570,130 @@ private @property string getParameterTypeString(alias F, int i)()
 }
 
 /// private
-private void getRestMethodName(T)(string method, out string http_verb, out string rest_name)
+private void getRestMethodName(T)(string method, out HttpMethod http_verb, out string rest_name)
 {
-	if( isPropertyGetter!T )               { http_verb = "GET"; rest_name = method; }
-	else if( isPropertySetter!T )          { http_verb = "PUT"; rest_name = method; }
-	else if( method.startsWith("get") )    { http_verb = "GET"; rest_name = method[3 .. $]; }
-	else if( method.startsWith("query") )  { http_verb = "GET"; rest_name = method[5 .. $]; }
-	else if( method.startsWith("set") )    { http_verb = "PUT"; rest_name = method[3 .. $]; }
-	else if( method.startsWith("put") )    { http_verb = "PUT"; rest_name = method[3 .. $]; }
-	else if( method.startsWith("update") ) { http_verb = "PATCH"; rest_name = method[6 .. $]; }
-	else if( method.startsWith("patch") )  { http_verb = "PATCH"; rest_name = method[5 .. $]; }
-	else if( method.startsWith("add") )    { http_verb = "POST"; rest_name = method[3 .. $]; }
-	else if( method.startsWith("create") ) { http_verb = "POST"; rest_name = method[6 .. $]; }
-	else if( method.startsWith("post") )   { http_verb = "POST"; rest_name = method[4 .. $]; }
-	else if( method.startsWith("remove") ) { http_verb = "DELETE"; rest_name = method[6 .. $]; }
-	else if( method.startsWith("erase") ) { http_verb = "DELETE"; rest_name = method[5 .. $]; }
-	else if( method.startsWith("delete") ) { http_verb = "DELETE"; rest_name = method[6 .. $]; }
-	else if( method == "index" )           { http_verb = "GET"; rest_name = ""; }
-	else { http_verb = "POST"; rest_name = method; }
+	if( isPropertyGetter!T )               { http_verb = HttpMethod.GET; rest_name = method; }
+	else if( isPropertySetter!T )          { http_verb = HttpMethod.PUT; rest_name = method; }
+	else if( method.startsWith("get") )    { http_verb = HttpMethod.GET; rest_name = method[3 .. $]; }
+	else if( method.startsWith("query") )  { http_verb = HttpMethod.GET; rest_name = method[5 .. $]; }
+	else if( method.startsWith("set") )    { http_verb = HttpMethod.PUT; rest_name = method[3 .. $]; }
+	else if( method.startsWith("put") )    { http_verb = HttpMethod.PUT; rest_name = method[3 .. $]; }
+	else if( method.startsWith("update") ) { http_verb = HttpMethod.PATCH; rest_name = method[6 .. $]; }
+	else if( method.startsWith("patch") )  { http_verb = HttpMethod.PATCH; rest_name = method[5 .. $]; }
+	else if( method.startsWith("add") )    { http_verb = HttpMethod.POST; rest_name = method[3 .. $]; }
+	else if( method.startsWith("create") ) { http_verb = HttpMethod.POST; rest_name = method[6 .. $]; }
+	else if( method.startsWith("post") )   { http_verb = HttpMethod.POST; rest_name = method[4 .. $]; }
+	else if( method.startsWith("remove") ) { http_verb = HttpMethod.DELETE; rest_name = method[6 .. $]; }
+	else if( method.startsWith("erase") )  { http_verb = HttpMethod.DELETE; rest_name = method[5 .. $]; }
+	else if( method.startsWith("delete") ) { http_verb = HttpMethod.DELETE; rest_name = method[6 .. $]; }
+	else if( method == "index" )           { http_verb = HttpMethod.GET; rest_name = ""; }
+	else { http_verb = HttpMethod.POST; rest_name = method; }
 }
 
 /// private
 private string[] parameterNames(T)()
 {
-	string funcStr = T.stringof;
+	auto str = extractParameters(T.stringof);
 	//pragma(msg, T.stringof);
- 
-	const firstPattern = ' ';
-	const secondPattern = ',';
-	
-	while( funcStr[0] != '(' ) funcStr = funcStr[1 .. $];
-	foreach( i; 0 .. funcStr.length )
-		if( funcStr[i] == ')' ){
-			funcStr = funcStr[0 .. i];
-			break;
+
+	string[] ret;
+	for( size_t i = 0; i < str.length; ){
+		skipWhitespace(str, i);
+		skipType(str, i);
+		skipWhitespace(str, i);
+		ret ~= skipIdent(str, i);
+		skipWhitespace(str, i);
+		if( i >= str.length ) break;
+		if( str[i] == '=' ){
+			i++;
+			skipWhitespace(str, i);
+			skipBalancedUntil(",", str, i);
+			if( i >= str.length ) break;
 		}
-	   
-	if( funcStr.length == 0 ) return null;
-	
-	funcStr ~= secondPattern;
-	   
-	string token;
-	string[] arr;
-	   
-	foreach( c; funcStr )
-	{
-		if( c != firstPattern && c != secondPattern ) token ~= c;
-		else {
-			if( token ) arr ~= token;
-			token = null;
+		assert(str[i] == ',');
+		i++;
+	}
+
+	return ret;
+}
+
+/// private
+private string[] parameterDefaultValues(T)()
+{
+	auto str = extractParameters(T.stringof);
+	//pragma(msg, T.stringof);
+
+	string[] ret;
+	for( size_t i = 0; i < str.length; ){
+		skipWhitespace(str, i);
+		skipType(str, i);
+		skipWhitespace(str, i);
+		skipIdent(str, i);
+		skipWhitespace(str, i);
+		if( i >= str.length ) break;
+		if( str[i] == '=' ){
+			i++;
+			skipWhitespace(str, i);
+			ret ~= skipBalancedUntil(",", str, i);
+			if( i >= str.length ) break;
+		}
+		assert(str[i] == ',');
+		i++;
+	}
+
+	return ret;
+}
+
+private string extractParameters(string str)
+{
+	size_t start = 0, end = str.length-1;
+	while( str[start] != '(' ) start++;
+	while( str[end] != ')' ) end--;
+	return str[start+1 .. end];
+}
+
+private void skipWhitespace(string str, ref size_t i)
+{
+	while( i < str.length && str[i] == ' ' ) i++;
+}
+
+private string skipIdent(string str, ref size_t i)
+{
+	size_t start = i;
+	while( i < str.length ){
+		switch( str[i] ){
+			default:
+				i++;
+				break;
+			case ' ',  ',', '(', ')', '=', '[', ']':
+				return str[start .. i];
 		}
 	}
-	
-	if( arr.length == 1 ) return arr;
-	
-	string[] result;
-	bool skip = false;
-	   
-	foreach( str; arr ){
-		skip = !skip;
-		if( skip ) continue;
-		result ~= str;
+	return str[start .. $];
+}
+
+private void skipType(string str, ref size_t i)
+{
+	skipIdent(str, i);
+	if( i < str.length && (str[i] == '(' || str[i] == '[') ){
+		int depth = 1;
+		for( ++i; i < str.length && depth > 0; i++ ){
+			if( str[i] == '(' || str[i] == '[' ) depth++;
+			else if( str[i] == ')' || str[i] == ']' ) depth--;
+		}
 	}
-	
-	return result;
+}
+
+private string skipBalancedUntil(string chars, string str, ref size_t i)
+{
+	int depth = 0;
+	size_t start = i;
+	while( i < str.length && (depth > 0 || chars.countUntil(str[i]) < 0) ){
+		if( str[i] == '(' || str[i] == '[' ) depth++;
+		else if( str[i] == ')' || str[i] == ']' ) depth--;
+		i++;
+	}
+	return str[start .. i];
 }
 
 /// private

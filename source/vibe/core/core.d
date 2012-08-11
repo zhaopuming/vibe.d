@@ -11,15 +11,20 @@ public import vibe.core.driver;
 
 import vibe.core.log;
 import vibe.utils.array;
+import std.algorithm;
 import std.conv;
 import std.exception;
+import std.functional;
 import std.range;
 import std.variant;
+import core.sync.mutex;
 import core.stdc.stdlib;
 import core.thread;
 
+import vibe.core.drivers.libev;
 import vibe.core.drivers.libevent2;
-//import vibe.core.drivers.libev;
+import vibe.core.drivers.win32;
+import vibe.core.drivers.winrt;
 
 version(Posix){
 	import core.sys.posix.signal;
@@ -39,10 +44,14 @@ version(Posix){
 	The event loop will continue running during the whole life time of the application.
 	Tasks will be started and handled from within the event loop.
 */
-int start()
+int runEventLoop()
 {
 	s_eventLoopRunning = true;
 	scope(exit) s_eventLoopRunning = false;
+
+	// runs any yield()ed tasks first
+	s_core.notifyIdle();
+
 	if( auto err = s_driver.runEventLoop() != 0){
 		if( err == 1 ){
 			logDebug("No events active, exiting message loop.");
@@ -54,6 +63,38 @@ int start()
 	return 0;
 }
 
+deprecated int start() { return runEventLoop(); }
+
+/**
+	Stops the currently running event loop.
+
+	Calling this function will cause the event loop to stop event processing and
+	the corresponding call to runEventLoop() will return to its caller.
+*/
+void exitEventLoop()
+{
+	assert(s_eventLoopRunning);
+	s_driver.exitEventLoop();
+}
+
+/**
+	Process all pending events without blocking.
+
+	Checks if events are ready to trigger immediately, and run their callbacks if so.
+*/
+int processEvents()
+{
+	return s_driver.processEvents();
+}
+
+/**
+	Sets a callback that is called whenever no events are left in the event queue.
+*/
+void setIdleHandler(void delegate() del)
+{
+	s_idleHandler = del;
+}
+
 /**
 	Runs a new asynchronous task.
 
@@ -61,19 +102,19 @@ int start()
 	continue to run until vibeYield() or any of the I/O or wait functions is
 	called.
 */
-Fiber runTask(void delegate() task)
+Task runTask(void delegate() task)
 {
 	// if there is no fiber available, create one.
 	if( s_availableFibersCount == 0 ){
 		if( s_availableFibers.length == 0 ) s_availableFibers.length = 1024;
 		logDebug("Creating new fiber...");
 		s_fiberCount++;
-		s_availableFibers[s_availableFibersCount++] = new Fiber(&defaultFiberFunc);
+		s_availableFibers[s_availableFibersCount++] = new CoreTask;
 	}
 	
 	// pick the first available fiber
 	auto f = s_availableFibers[--s_availableFibersCount];
-	s_taskFuncs[f] = task;
+	f.m_taskFunc = task;
 	logDebug("initial task call");
 	s_tasks ~= f;
 	s_core.resumeTask(f);
@@ -91,7 +132,14 @@ Fiber runTask(void delegate() task)
 */
 void runWorkerTask(void delegate() task)
 {
-	s_driver.runWorkerTask(task);
+	if( st_workerTaskMutex ){
+		synchronized(st_workerTaskMutex){
+			st_workerTasks ~= task;
+		}
+		st_workerTaskSignal.emit();
+	} else {
+		runTask(task);
+	}
 }
 
 /**
@@ -104,7 +152,8 @@ void runWorkerTask(void delegate() task)
 */
 void yield()
 {
-	assert(false);
+	s_yieldedTasks ~= cast(Task)Fiber.getThis();
+	rawYield();
 }
 
 
@@ -152,13 +201,9 @@ Timer setTimer(Duration timeout, void delegate() callback, bool periodic = false
 */
 void setTaskLocal(T)(string name, T value)
 {
-	auto self = Fiber.getThis();
-	auto ptls = self in s_taskLocalStorage;
-	if( !ptls ){
-		s_taskLocalStorage[self] = null;
-		ptls = self in s_taskLocalStorage;
-	}
-	(*ptls)[name] = Variant(value);
+	auto self = cast(CoreTask)Fiber.getThis();
+	if( self ) self.m_taskLocalStorage[name] = Variant(value);
+	else s_taskLocalStorageGlobal[name] = Variant(value);
 }
 
 /**
@@ -166,9 +211,10 @@ void setTaskLocal(T)(string name, T value)
 */
 T getTaskLocal(T)(string name)
 {
-	auto self = Fiber.getThis();
-	auto ptls = self in s_taskLocalStorage;
-	auto pvar = ptls ? name in *ptls : null;
+	auto self = cast(CoreTask)Fiber.getThis();
+	Variant* pvar;
+	if( self ) pvar = name in self.m_taskLocalStorage;
+	else pvar = name in s_taskLocalStorageGlobal;
 	enforce(pvar !is null, "Accessing unset TLS variable '"~name~"'.");
 	return pvar.get!T();
 }
@@ -178,39 +224,123 @@ T getTaskLocal(T)(string name)
 */
 bool isTaskLocalSet(string name)
 {
-	auto self = Fiber.getThis();
-	auto ptls = self in s_taskLocalStorage;
-	auto pvar = ptls ? name in *ptls : null;
+	auto self = cast(CoreTask)Fiber.getThis();
+	Variant* pvar;
+	if( self ) pvar = name in self.m_taskLocalStorage;
+	else pvar = name in s_taskLocalStorageGlobal;
 	return pvar !is null;
+}
+
+/**
+	Sets the stack size for tasks.
+
+	The default stack size is set to 16 KiB, which is sufficient for most tasks. Tuning this value
+	can be used to reduce memory usage for great numbers of concurrent tasks or to allow applications
+	with heavy stack use.
+
+	Note that this function must be called before any task is started to have an effect.
+*/
+void setTaskStackSize(size_t sz)
+{
+	s_taskStackSize = sz;
+}
+
+/**
+	Enables multithreaded worker task processing.
+
+	This function will start up a number of worker threads that will process tasks started using
+	runWorkerTask(). runTask() will still execute tasks on the calling thread.
+
+	Note that this functionality is experimental right now and is not recommended for general use.
+*/
+void enableWorkerThreads()
+{
+	assert(st_workerTaskMutex is null);
+	st_workerTaskMutex = new Mutex;
+
+	foreach( i; 0 .. 4 ){
+		auto thr = new Thread(&workerThreadFunc);
+		thr.name = "Vibe Task Worker";
+		thr.start();
+	}
 }
 
 /**
 	A version string representing the current vibe version
 */
-enum VibeVersionString = "0.7.5";
+enum VibeVersionString = "0.7.7";
 
 
 /**************************************************************************************************/
 /* private types                                                                                  */
 /**************************************************************************************************/
 
+private class CoreTask : Task {
+	private {
+		void delegate() m_taskFunc;
+		Variant[string] m_taskLocalStorage;
+		Exception m_exception;
+	}
+
+	this()
+	{
+		super(&run, s_taskStackSize);
+	}
+
+	private void run()
+	{
+		while(true){
+			while( !m_taskFunc )
+				s_core.yieldForEvent();
+
+			auto task = m_taskFunc;
+			m_taskFunc = null;
+			try {
+				logTrace("entering task.");
+				task();
+				logTrace("exiting task.");
+			} catch( Exception e ){
+				logError("Task terminated with exception: %s", e.toString());
+			}
+			m_taskLocalStorage = null;
+			
+			// make the fiber available for the next task
+			if( s_availableFibers.length <= s_availableFibersCount )
+				s_availableFibers.length = 2*s_availableFibers.length;
+			s_availableFibers[s_availableFibersCount++] = this;
+		}
+	}
+}
+
+
 private class VibeDriverCore : DriverCore {
+	private {
+		Duration m_gcCollectTimeout;
+		Timer m_gcTimer;
+		bool m_ignoreIdleForGC = false;
+	}
+
+	private void setupGcTimer()
+	{
+		m_gcTimer = s_driver.createTimer(&collectGarbage);
+		m_gcCollectTimeout = dur!"seconds"(2);
+	}
+
 	void yieldForEvent()
 	{
-		auto fiber = Fiber.getThis();
+		auto fiber = cast(CoreTask)Fiber.getThis();
 		if( fiber ){
 			logTrace("yield");
 			Fiber.yield();
 			logTrace("resume");
-			auto pe = fiber in s_exceptions;
-			if( pe ){
-				auto e = *pe;
-				s_exceptions.remove(fiber);
+			auto e = fiber.m_exception;
+			if( e ){
+				fiber.m_exception = null;
 				throw e;
 			}
 		} else {
 			assert(!s_eventLoopRunning, "Event processing outside of a fiber should only happen before the event loop is running!?");
-			if( auto err = s_driver.processEvents() != 0){
+			if( auto err = s_driver.runEventLoopOnce() ){
 				if( err == 1 ){
 					logDebug("No events registered, exiting event loop.");
 					throw new Exception("No events registered in vibeYieldForEvent.");
@@ -221,25 +351,51 @@ private class VibeDriverCore : DriverCore {
 		}
 	}
 
-	void resumeTask(Fiber fiber, Exception event_exception = null)
+	void resumeTask(Task task, Exception event_exception = null)
 	{
-		assert(fiber.state == Fiber.State.HOLD, "Resuming task that is " ~ (fiber.state == Fiber.State.TERM ? "terminated" : "running"));
+		CoreTask ctask = cast(CoreTask)task;
+		assert(task.state == Fiber.State.HOLD, "Resuming task that is " ~ (task.state == Fiber.State.TERM ? "terminated" : "running"));
 
 		if( event_exception ){
 			extrap();
-			s_exceptions[fiber] = event_exception;
+			ctask.m_exception = event_exception;
 		}
 		
-		auto uncaught_exception = fiber.call(false);
+		auto uncaught_exception = task.call(false);
 		if( uncaught_exception ){
 			extrap();
-			assert(fiber.state == Fiber.State.TERM);
+			assert(task.state == Fiber.State.TERM);
 			logError("Task terminated with unhandled exception: %s", uncaught_exception.toString());
 		}
 		
-		if( fiber.state == Fiber.State.TERM ){
-			s_tasks.removeFromArray(fiber);
+		if( task.state == Fiber.State.TERM ){
+			s_tasks.removeFromArray(ctask);
 		}
+	}
+
+	void notifyIdle()
+	{
+		while(true){
+			Task[] tmp;
+			swap(s_yieldedTasks, tmp);
+			foreach(t; tmp) resumeTask(t);
+			if( s_yieldedTasks.length == 0 ) break;
+			processEvents();
+		}
+
+		if( s_idleHandler ) s_idleHandler();
+
+		if( !m_ignoreIdleForGC && m_gcTimer ){
+			m_gcTimer.rearm(m_gcCollectTimeout);
+		} else m_ignoreIdleForGC = false;
+	}
+
+	private void collectGarbage()
+	{
+		import core.memory;
+		logTrace("gc idle collect");
+		GC.collect();
+		m_ignoreIdleForGC = true;
 	}
 }
 
@@ -249,19 +405,24 @@ private class VibeDriverCore : DriverCore {
 /**************************************************************************************************/
 
 private {
-	Fiber[] s_tasks;
-	Exception[Fiber] s_exceptions;
+	__gshared size_t s_taskStackSize = 4*4096;
+	CoreTask[] s_tasks;
+	Task[] s_yieldedTasks;
 	bool s_eventLoopRunning = false;
 	__gshared VibeDriverCore s_core;
 	EventDriver s_driver;
-	Variant[string][Fiber] s_taskLocalStorage;
-	//Variant[string] s_currentTaskStorage;
-	Fiber[] s_availableFibers;
+	Variant[string] s_taskLocalStorageGlobal; // for use outside of a task
+	CoreTask[] s_availableFibers;
 	size_t s_availableFibersCount;
 	size_t s_fiberCount;
-	void delegate()[Fiber] s_taskFuncs;
+	void delegate() s_idleHandler;
+
+	__gshared Mutex st_workerTaskMutex;
+	__gshared void delegate()[] st_workerTasks;
+	__gshared Signal st_workerTaskSignal;
 }
 
+// per process setup
 shared static this()
 {
 	version(Windows){
@@ -272,12 +433,11 @@ shared static this()
 		WSAStartup(0x0202, &data);
 	}
 	
-	logTrace("event_set_mem_functions");
+	logTrace("create driver core");
 	s_core = new VibeDriverCore;
-	s_driver = new Libevent2Driver(s_core);
-	//s_driver = new LibevDriver(s_core);
-	
+
 	version(Posix){
+		logTrace("setup signal handler");
 		// support proper shutdown using signals
 		sigset_t sigset;
 		sigemptyset(&sigset);
@@ -287,7 +447,7 @@ shared static this()
 		siginfo.sa_flags = SA_RESTART;
 		sigaction(SIGINT, &siginfo, null);
 		sigaction(SIGTERM, &siginfo, null);
-		
+
 		siginfo.sa_handler = &onBrokenPipe;
 		sigaction(SIGPIPE, &siginfo, null);
 	}
@@ -295,33 +455,80 @@ shared static this()
 
 shared static ~this()
 {
-	// TODO: use destroy instead
-	delete s_driver;
+	bool tasks_left = false;
+	synchronized(st_workerTaskMutex){
+		if( !st_workerTasks.empty ) tasks_left = true;
+	}
+	if( !s_yieldedTasks.empty ) tasks_left = true;
+	if( tasks_left ) logWarn("There are still tasks running at exit.");
+
 	delete s_core;
 }
 
-private void defaultFiberFunc()
+// per thread setup
+static this()
 {
-	auto fthis = Fiber.getThis();
-	while(true){
-		while( fthis !in s_taskFuncs )
-			s_core.yieldForEvent();
+	assert(s_core !is null);
 
-		auto task = s_taskFuncs[fthis];
-		s_taskFuncs.remove(fthis);
-		try {
-			logTrace("entering task.");
-			task();
-			logTrace("exiting task.");
-		} catch( Exception e ){
-			logDebug("task terminated with exception: %s", e.toString());
+	logTrace("create driver");
+	version(VibeWin32Driver) s_driver = new Win32EventDriver(s_core);
+	else version(VibeWinrtDriver) s_driver = new WinRtEventDriver(s_core);
+	else version(VibeLibevDriver) s_driver = new LibevDriver(s_core);
+	else s_driver = new Libevent2Driver(s_core);
+
+	version(VibeIdleCollect){
+		logTrace("setup gc");
+		s_core.setupGcTimer();
+	}
+
+	if( st_workerTaskMutex ){
+		synchronized(st_workerTaskMutex)
+		{
+			if( !st_workerTaskSignal ){
+				st_workerTaskSignal = s_driver.createSignal();
+				st_workerTaskSignal.release();
+				assert(!st_workerTaskSignal.isOwner());
+			}
 		}
-		clearTaskLocals();
-		
-		// make the fiber available for the next task
-		if( s_availableFibers.length <= s_availableFibersCount )
-			s_availableFibers.length = 2*s_availableFibers.length;
-		s_availableFibers[s_availableFibersCount++] = fthis;
+	}
+}
+
+static ~this()
+{
+	// TODO: use destroy instead
+	delete s_driver;
+}
+
+private void workerThreadFunc()
+{
+	logDebug("entering worker thread");
+	runTask(toDelegate(&handleWorkerTasks));
+	logDebug("running event loop");
+	runEventLoop();
+}
+
+private void handleWorkerTasks()
+{
+	logDebug("worker task enter");
+	yield();
+
+	logDebug("worker task loop enter");
+	assert(!st_workerTaskSignal.isOwner());
+	while(true){
+		void delegate() t;
+		auto emit_count = st_workerTaskSignal.emitCount;
+		synchronized(st_workerTaskMutex){
+			logDebug("worker task check");
+			if( st_workerTasks.length ){
+				logDebug("worker task got");
+				t = st_workerTasks.front;
+				st_workerTasks.popFront();
+			}
+		}
+		assert(!st_workerTaskSignal.isOwner());
+		if( t ) runTask(t);
+		else st_workerTaskSignal.wait(emit_count);
+		assert(!st_workerTaskSignal.isOwner());
 	}
 }
 
@@ -330,20 +537,12 @@ private extern(C) void extrap()
 	logTrace("exception trap");
 }
 
-
-private void clearTaskLocals()
-{
-	auto self = Fiber.getThis();
-	auto ptls = self in s_taskLocalStorage;
-	if( ptls ) s_taskLocalStorage.remove(self);
-}
-
 version(Posix){
 	private extern(C) void onSignal(int signal)
 	{
 		logInfo("Received signal %d. Shutting down.", signal);
 
-		if( s_eventLoopRunning ) s_driver.exitEventLoop();
+		if( s_eventLoopRunning ) exitEventLoop();
 		else exit(1);
 	}
 	

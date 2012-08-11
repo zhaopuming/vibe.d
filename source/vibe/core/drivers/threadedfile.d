@@ -11,11 +11,13 @@ module vibe.core.drivers.threadedfile;
 import vibe.core.log;
 import vibe.core.driver;
 import vibe.inet.url;
+import vibe.utils.string;
 
 import std.algorithm;
 import std.conv;
 import std.exception;
 import std.string;
+import core.stdc.errno;
 
 version(Posix){
 	import core.sys.posix.fcntl;
@@ -72,6 +74,9 @@ class ThreadedFileStream : FileStream {
 			case FileMode.Read:
 				m_fileDescriptor = open(path.toStringz(), O_RDONLY|O_BINARY);
 				break;
+			case FileMode.ReadWrite:
+				m_fileDescriptor = open(path.toStringz(), O_BINARY);
+				break;
 			case FileMode.CreateTrunc:
 				m_fileDescriptor = open(path.toStringz(), O_WRONLY|O_CREAT|O_TRUNC|O_BINARY, octal!644);
 				break;
@@ -80,9 +85,9 @@ class ThreadedFileStream : FileStream {
 				break;
 		}
 		if( m_fileDescriptor < 0 )
-			throw new Exception("Failed to open '"~path~"' for " ~ (m_mode == FileMode.Read ?		 "reading.":
-			                                                        m_mode == FileMode.CreateTrunc ? "writing." : 
-			                                                                                         "appending."));
+			//throw new Exception(formatString("Failed to open '%s' with %s: %d", path, cast(int)mode, errno));
+			throw new Exception("Failed to open "~path);
+		
 			
 		version(linux){
 			// stat_t seems to be defined wrong on linux/64
@@ -101,6 +106,11 @@ class ThreadedFileStream : FileStream {
 		lseek(m_fileDescriptor, 0, SEEK_SET);
 		
 		logDebug("opened file %s with %d bytes as %d", path, m_size, m_fileDescriptor);
+	}
+
+	~this()
+	{
+		close();
 	}
 	
 	@property int fd() { return m_fileDescriptor; }
@@ -130,6 +140,8 @@ class ThreadedFileStream : FileStream {
 		enforce(.lseek(m_fileDescriptor, offset, SEEK_SET) == offset, "Failed to seek in file.");
 		m_ptr = offset;
 	}
+
+	ulong tell() { return m_ptr; }
 	
 	void close()
 	{

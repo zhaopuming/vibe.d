@@ -12,6 +12,7 @@ public import vibe.http.status;
 import vibe.core.log;
 import vibe.core.tcp;
 import vibe.utils.array;
+import vibe.utils.memory;
 import vibe.utils.string;
 
 import std.algorithm;
@@ -29,6 +30,41 @@ enum HttpVersion {
 	HTTP_1_1
 }
 
+enum HttpMethod {
+	GET,
+	HEAD,
+	PUT,
+	POST,
+	PATCH,
+	DELETE,
+	OPTIONS,
+	TRACE,
+	CONNECT
+}
+
+string httpMethodString(HttpMethod m)
+{
+	static immutable strings = ["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"];
+	static assert(m.max+1 == strings.length);
+	return strings[m];
+}
+
+HttpMethod httpMethodFromString(string str)
+{
+	switch(str){
+		default: throw new Exception("Invalid HTTP method: "~str);
+		case "GET": return HttpMethod.GET;
+		case "HEAD": return HttpMethod.HEAD;
+		case "PUT": return HttpMethod.PUT;
+		case "POST": return HttpMethod.POST;
+		case "PATCH": return HttpMethod.PATCH;
+		case "DELETE": return HttpMethod.DELETE;
+		case "OPTIONS": return HttpMethod.OPTIONS;
+		case "TRACE": return HttpMethod.TRACE;
+		case "CONNECT": return HttpMethod.CONNECT;
+	}
+}
+
 /**
 	Represents an HTTP request made to a server.
 */
@@ -39,7 +75,7 @@ class HttpRequest {
 	
 	public {
 		HttpVersion httpVersion = HttpVersion.HTTP_1_1;
-		string method = "GET";
+		HttpMethod method = HttpMethod.GET;
 		string url = "/";
 		StrMapCI headers;
 	}
@@ -89,7 +125,6 @@ class HttpResponse {
 	@property string contentType() const { auto pct = "Content-Type" in headers; return pct ? *pct : "application/octet-stream"; }
 	@property void contentType(string ct) { headers["Content-Type"] = ct; }
 }
-
 
 
 class MultiPart {
@@ -297,21 +332,23 @@ final class Cookie {
 */
 struct StrMapCI {
 	private {
-		Tuple!(string, string)[64] m_fields;
+		static struct Field { uint keyCheckSum; string key; string value; }
+		Field[64] m_fields;
 		size_t m_fieldCount = 0;
-		Tuple!(string, string)[] m_extendedFields;
+		Field[] m_extendedFields;
 		static char[256] s_keyBuffer;
 	}
 	
 	@property size_t length() const { return m_fieldCount + m_extendedFields.length; }
 
 	void remove(string key){
-		auto idx = getIndex(m_fields[0 .. m_fieldCount], key);
+		auto keysum = computeCheckSumI(key);
+		auto idx = getIndex(m_fields[0 .. m_fieldCount], key, keysum);
 		if( idx >= 0 ){
 			removeFromArrayIdx(m_fields[0 .. m_fieldCount], idx);
 			m_fieldCount--;
 		} else {
-			idx = getIndex(m_extendedFields, key);
+			idx = getIndex(m_extendedFields, key, keysum);
 			enforce(idx >= 0);
 			removeFromArrayIdx(m_extendedFields, idx);
 		}
@@ -325,16 +362,17 @@ struct StrMapCI {
 	string opIndexAssign(string val, string key){
 		auto pitm = key in this;
 		if( pitm ) *pitm = val;
-		else if( m_fieldCount < m_fields.length ) m_fields[m_fieldCount++] = tuple(key, val);
-		else m_extendedFields ~= tuple(key, val);
+		else if( m_fieldCount < m_fields.length ) m_fields[m_fieldCount++] = Field(computeCheckSumI(key), key, val);
+		else m_extendedFields ~= Field(computeCheckSumI(key), key, val);
 		return val;
 	}
 
 	inout(string)* opBinaryRight(string op)(string key) inout if(op == "in") {
-		auto idx = getIndex(m_fields[0 .. m_fieldCount], key);
-		if( idx >= 0 ) return &m_fields[idx][1];
-		idx = getIndex(m_extendedFields, key);
-		if( idx >= 0 ) return &m_extendedFields[idx][1];
+		uint keysum = computeCheckSumI(key);
+		auto idx = getIndex(m_fields[0 .. m_fieldCount], key, keysum);
+		if( idx >= 0 ) return &m_fields[idx].value;
+		idx = getIndex(m_extendedFields, key, keysum);
+		if( idx >= 0 ) return &m_extendedFields[idx].value;
 		return null;
 	}
 
@@ -345,13 +383,13 @@ struct StrMapCI {
 	int opApply(int delegate(ref string key, ref string val) del)
 	{
 		foreach( ref kv; m_fields[0 .. m_fieldCount] ){
-			string kcopy = kv[0];
-			if( auto ret = del(kcopy, kv[1]) )
+			string kcopy = kv.key;
+			if( auto ret = del(kcopy, kv.value) )
 				return ret;
 		}
 		foreach( ref kv; m_extendedFields ){
-			string kcopy = kv[0];
-			if( auto ret = del(kcopy, kv[1]) )
+			string kcopy = kv.key;
+			if( auto ret = del(kcopy, kv.value) )
 				return ret;
 		}
 		return 0;
@@ -360,11 +398,11 @@ struct StrMapCI {
 	int opApply(int delegate(ref string val) del)
 	{
 		foreach( ref kv; m_fields[0 .. m_fieldCount] ){
-			if( auto ret = del(kv[1]) )
+			if( auto ret = del(kv.value) )
 				return ret;
 		}
 		foreach( ref kv; m_extendedFields ){
-			if( auto ret = del(kv[1]) )
+			if( auto ret = del(kv.value) )
 				return ret;
 		}
 		return 0;
@@ -379,45 +417,105 @@ struct StrMapCI {
 		return ret;
 	}
 
-	private ptrdiff_t getIndex(in Tuple!(string, string)[] map, string key)
+	private ptrdiff_t getIndex(in Field[] map, string key, uint keysum)
 	const {
-		foreach( i, ref const(Tuple!(string, string)) entry; map )
-			if( icmp2(entry[0], key) == 0 )
+		foreach( i, ref const(Field) entry; map ){
+			if( entry.keyCheckSum != keysum ) continue;
+			if( icmp2(entry.key, key) == 0 )
 				return i;
+		}
 		return -1;
+	}
+	
+	// very simple check sum function with a good chance to match
+	// strings with different case equal
+	private static uint computeCheckSumI(string s)
+	{
+		import std.uni;
+		uint csum = 0;
+		foreach( i; 0 .. s.length )
+			csum += 357*(s[i]&0x1101_1111);
+		return csum;
 	}
 }
 
-string toRFC822DateTimeString(SysTime time)
+void writeRFC822DateString(R)(ref R dst, SysTime time)
 {
 	assert(time.timezone == UTC());
-	auto ret = appender!string();
-	ret.reserve(29);
+
 	static immutable dayStrings = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 	static immutable monthStrings = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-	formattedWrite(ret, "%s, %02d %s %d %02d:%02d:%02d %s", dayStrings[time.dayOfWeek],
-		time.day, monthStrings[time.month-1], time.year, time.hour, time.minute, time.second, "GMT");
-	return ret.data;
+	dst.put(dayStrings[time.dayOfWeek]);
+	dst.put(", ");
+	writeDecimal2(dst, time.day);
+	dst.put(' ');
+	dst.put(monthStrings[time.month-1]);
+	dst.put(' ');
+	writeDecimal(dst, time.year);
+}
+
+void writeRFC822TimeString(R)(ref R dst, SysTime time)
+{
+	assert(time.timezone == UTC());
+	writeDecimal2(dst, time.hour);
+	dst.put(':');
+	writeDecimal2(dst, time.minute);
+	dst.put(':');
+	writeDecimal2(dst, time.second);
+	dst.put(" GMT");
+}
+
+void writeRFC822DateTimeString(R)(ref R dst, SysTime time)
+{
+	writeRFC822DateString(dst, time);
+	dst.put(' ');
+	writeRFC822TimeString(dst, time);
 }
 
 string toRFC822TimeString(SysTime time)
 {
-	assert(time.timezone == UTC());
-	auto ret = appender!string();
-	ret.reserve(12);
-	formattedWrite(ret, "%02d:%02d:%02d %s", time.hour, time.minute, time.second, "GMT");
+	auto ret = new FixedAppender!(string, 12);
+	writeRFC822TimeString(ret, time);
 	return ret.data;
 }
 
 string toRFC822DateString(SysTime time)
 {
-	assert(time.timezone == UTC());
-	auto ret = appender!string();
-	ret.reserve(16);
-	static immutable dayStrings = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-	static immutable monthStrings = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-	formattedWrite(ret, "%s, %02d %s %d", dayStrings[time.dayOfWeek],
-		time.day, monthStrings[time.month-1], time.year);
+	auto ret = new FixedAppender!(string, 16);
+	writeRFC822DateString(ret, time);
 	return ret.data;
 }
 
+string toRFC822DateTimeString(SysTime time)
+{
+	auto ret = new FixedAppender!(string, 29);
+	writeRFC822DateTimeString(ret, time);
+	return ret.data;
+}
+
+private void writeDecimal2(R)(ref R dst, uint n)
+{
+	auto d1 = n % 10;
+	auto d2 = (n / 10) % 10;
+	dst.put(cast(char)(d2 + '0'));
+	dst.put(cast(char)(d1 + '0'));
+}
+
+private void writeDecimal(R)(ref R dst, uint n)
+{
+	if( n == 0 ){
+		dst.put('0');
+		return;
+	}
+
+	// determine all digits
+	uint[10] digits;
+	int i = 0;
+	while( n > 0 ){
+		digits[i++] = n % 10;
+		n /= 10;
+	}
+
+	// write out the digits in reverse order
+	while( i > 0 ) dst.put(cast(char)(digits[--i] + '0'));
+}

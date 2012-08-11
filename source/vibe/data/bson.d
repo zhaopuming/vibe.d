@@ -9,6 +9,7 @@ module vibe.data.bson;
 
 public import vibe.data.json;
 import vibe.core.log;
+import vibe.data.utils;
 
 import std.algorithm;
 import std.array;
@@ -28,30 +29,53 @@ alias immutable(ubyte)[] bdata_t;
 
 */
 struct Bson {
+	/// Represents the type of a BSON value
 	enum Type : ubyte {
+		/// End marker - should never occur explicitly
 		End        = 0x00,
+		/// A 64-bit floating point value
 		Double     = 0x01,
+		/// A UTF-8 string
 		String     = 0x02,
+		/// An object aka. dictionary of string to Bson
 		Object     = 0x03,
+		/// An array of BSON values
 		Array      = 0x04,
+		/// Raw binary data (ubyte[])
 		BinData    = 0x05,
-		Undefined  = 0x06, // Deprecated
+		/// Deprecated
+		Undefined  = 0x06,
+		/// BSON Object ID (96-bit)
 		ObjectID   = 0x07,
+		/// Boolean value
 		Bool       = 0x08,
+		/// Date value (UTC)
 		Date       = 0x09,
+		/// Null value
 		Null       = 0x0A,
+		/// Regular expression
 		Regex      = 0x0B,
-		DBRef      = 0x0C, // Deprecated.
-		Code       = 0x0D, // JavaScript code
+		/// Deprecated
+		DBRef      = 0x0C,
+		/// JaveScript code
+		Code       = 0x0D,
+		/// Symbol/variable name
 		Symbol     = 0x0E,
-		CodeWScope = 0x0F, // JavaScript code with scope
+		/// JavaScript code with scope
+		CodeWScope = 0x0F,
+		/// 32-bit integer
 		Int        = 0x10,
+		/// Timestamp value
 		Timestamp  = 0x11,
+		/// 64-bit integer
 		Long       = 0x12,
+		/// Internal value
 		MinKey     = 0xff,
+		/// Internal value
 		MaxKey     = 0x7f
 	}
 
+	/// Returns a new, empty Bson value of type Object.
 	static @property Bson EmptyObject(){ return Bson(cast(Bson[string])null); }
 
 	private {
@@ -106,38 +130,38 @@ struct Bson {
 		m_type = type;
 	}
 	/// ditto
-	this(Bson[string] value) { opAssign(value); }
+	this(in Bson[string] value) { opAssign(value); }
 	/// ditto
-	this(Bson[] value) { opAssign(value); }
+	this(in Bson[] value) { opAssign(value); }
 	/// ditto
-	this(BsonBinData value) { opAssign(value); }
+	this(in BsonBinData value) { opAssign(value); }
 	/// ditto
-	this(BsonObjectID value) { opAssign(value); }
+	this(in BsonObjectID value) { opAssign(value); }
 	/// ditto
 	this(bool value) { opAssign(value); }
 	/// ditto
-	this(BsonDate value) { opAssign(value); }
+	this(in BsonDate value) { opAssign(value); }
 	/// ditto
 	this(typeof(null)) { opAssign(null); }
 	/// ditto
-	this(BsonRegex value) { opAssign(value); }
+	this(in BsonRegex value) { opAssign(value); }
 	/// ditto
 	this(int value) { opAssign(value); }
 	/// ditto
-	this(BsonTimestamp value) { opAssign(value); }
+	this(in BsonTimestamp value) { opAssign(value); }
 	/// ditto
 	this(long value) { opAssign(value); }
 	/// ditto
-	this(Json value) { opAssign(value); }
+	this(in Json value) { opAssign(value); }
 
 	/**
 		Assigns a D type to a BSON value.
 	*/
-	void opAssign(Bson other)
+	void opAssign(in Bson other)
 	{
 		m_data = other.m_data;
- 		m_type = other.m_type;
- 	}
+		m_type = other.m_type;
+	}
 	/// ditto
 	void opAssign(double value)
 	{
@@ -189,7 +213,7 @@ struct Bson {
 		m_type = Type.Array;
 	}
 	/// ditto
-	void opAssign(BsonBinData value)
+	void opAssign(in BsonBinData value)
 	{
 		auto app = appender!bdata_t();
 		app.put(toBsonData(cast(int)value.rawData.length));
@@ -200,7 +224,7 @@ struct Bson {
 		m_type = Type.BinData;
 	}
 	/// ditto
-	void opAssign(BsonObjectID value)
+	void opAssign(in BsonObjectID value)
 	{
 		m_data = value.m_bytes.idup;
 		m_type = Type.ObjectID;
@@ -212,7 +236,7 @@ struct Bson {
 		m_type = Type.Bool;
 	}
 	/// ditto
-	void opAssign(BsonDate value)
+	void opAssign(in BsonDate value)
 	{
 		m_data = toBsonData(value.m_time).idup;
 		m_type = Type.Date;
@@ -224,7 +248,7 @@ struct Bson {
 		m_type = Type.Null;
 	}
 	/// ditto
-	void opAssign(BsonRegex value)
+	void opAssign(in BsonRegex value)
 	{
 		auto app = appender!bdata_t();
 		putCString(app, value.expression);
@@ -239,7 +263,7 @@ struct Bson {
 		m_type = Type.Int;
 	}
 	/// ditto
-	void opAssign(BsonTimestamp value)
+	void opAssign(in BsonTimestamp value)
 	{
 		m_data = toBsonData(value.m_time).idup;
 		m_type = Type.Timestamp;
@@ -251,7 +275,7 @@ struct Bson {
 		m_type = Type.Long;
 	}
 	/// ditto
-	void opAssign(Json value)
+	void opAssign(in Json value)
 	{
 		auto app = appender!bdata_t();
 		m_type = writeBson(app, value);
@@ -353,6 +377,8 @@ struct Bson {
 		return def;
 	}
 
+	/** Returns the length of a BSON value of type String, Array or BinData.
+	*/
 	@property size_t length() const {
 		switch( m_type ){
 			default: enforce(false, "Bson objects of type "~to!string(m_type)~" do not have a length field."); break;
@@ -363,6 +389,10 @@ struct Bson {
 		assert(false);
 	}
 
+	/** Allows accessing fields of a BSON object using [].
+
+		Returns a null value if the specified field does not exist.
+	*/
 	inout(Bson) opIndex(string idx) inout {
 		checkType(Type.Object);
 		auto d = m_data[4 .. $];
@@ -379,7 +409,7 @@ struct Bson {
 		}
 		return Bson(null);
 	}
-
+	/// ditto
 	void opIndexAssign(T)(T value, string idx){
 		auto newcont = appender!bdata_t();
 		checkType(Type.Object);
@@ -416,6 +446,10 @@ struct Bson {
 		m_data = newdata.data;
 	}
 
+	/** Allows index based access of a BSON array value.
+
+		Returns a null value if the index is out of bounds.
+	*/
 	inout(Bson) opIndex(size_t idx) inout {
 		checkType(Type.Array);
 		auto d = m_data[4 .. $];
@@ -434,8 +468,9 @@ struct Bson {
 		return Bson(null);
 	}
 
-	/**
-		Allows to access existing fields of a JSON object using dot syntax.
+	/** Allows to access existing fields of a JSON object using dot syntax.
+
+		Returns a null value for non-existent fields.
 	*/
 	@property inout(Bson) opDispatch(string prop)() inout { return opIndex(prop); }
 	/// ditto
@@ -446,7 +481,7 @@ struct Bson {
 		return m_data == other.m_data;
 	}
 
-	private void checkType(Type[] valid_types...)
+	private void checkType(in Type[] valid_types...)
 	const {
 		foreach( t; valid_types )
 			if( m_type == t )
@@ -455,6 +490,10 @@ struct Bson {
 	}
 }
 
+
+/**
+	Represents a BSON binary data value (Bson.Type.BinData).
+*/
 struct BsonBinData {
 	enum Type : ubyte {
 		Generic = 0x00,
@@ -480,6 +519,10 @@ struct BsonBinData {
 	@property bdata_t rawData() const { return m_data; }
 }
 
+
+/**
+	Represents a BSON object id (Bson.Type.BinData).
+*/
 struct BsonObjectID {
 	private {
 		ubyte[12] m_bytes;
@@ -488,11 +531,15 @@ struct BsonObjectID {
 		static uint MACHINE_ID = 0;
 	}
 
+	/** Constructs a new object ID from the given raw byte array.
+	*/
 	this( in ubyte[] bytes ){
 		assert(bytes.length == 12);
 		m_bytes[] = bytes;
 	}
 
+	/** Creates an on object ID from a string in standard hexa-decimal form.
+	*/
 	static BsonObjectID fromString(string str)
 	{
 		assert(str.length == 24, "BSON Object ID string s must be 24 characters.");
@@ -514,9 +561,11 @@ struct BsonObjectID {
 		}
 		return ret;
 	}
-
+	/// ditto
 	alias fromString fromHexString;
 
+	/** Generates a unique object ID.
+	*/
 	static BsonObjectID generate()
 	{
 		import std.datetime;
@@ -525,23 +574,33 @@ struct BsonObjectID {
 
 		if( ms_pid == -1 ) ms_pid = getpid();
 		if( MACHINE_ID == 0 ) MACHINE_ID = uniform(0, 0xffffff);
-	  	auto unixTime = Clock.currTime(UTC()).toUnixTime();
+		auto unixTime = Clock.currTime(UTC()).toUnixTime();
 
-	  	BsonObjectID ret = void;
-	  	ret.m_bytes[0 .. 4] = toBigEndianData(cast(uint)unixTime);
-	  	ret.m_bytes[4 .. 7] = toBsonData(MACHINE_ID)[0 .. 3];
-	  	ret.m_bytes[7 .. 9] = toBsonData(cast(ushort)ms_pid);
-	  	ret.m_bytes[9 .. 12] = toBigEndianData(ms_inc++)[1 .. 4];
-	  	return ret;
+		BsonObjectID ret = void;
+		ret.m_bytes[0 .. 4] = toBigEndianData(cast(uint)unixTime);
+		ret.m_bytes[4 .. 7] = toBsonData(MACHINE_ID)[0 .. 3];
+		ret.m_bytes[7 .. 9] = toBsonData(cast(ushort)ms_pid);
+		ret.m_bytes[9 .. 12] = toBigEndianData(ms_inc++)[1 .. 4];
+		return ret;
 	}
 
-	static BsonObjectID createDateID(SysTime date)
+	/** Creates a pseudo object ID that matches the given date.
+
+		This kind of ID can be useful to query a database for items in a certain
+		date interval using their ID. This works using the property of standard BSON
+		object IDs that they store their creation date as part of the ID. Note that
+		this date part is only 32-bit wide and is limited to the same timespan as a
+		32-bit Unix timestamp.
+	*/
+	static BsonObjectID createDateID(in SysTime date)
 	{
-	  	BsonObjectID ret;
-	  	ret.m_bytes[0 .. 4] = toBigEndianData(cast(uint)date.toUnixTime());
-	  	return ret;
+		BsonObjectID ret;
+		ret.m_bytes[0 .. 4] = toBigEndianData(cast(uint)date.toUnixTime());
+		return ret;
 	}
 
+	/** Returns true for any non-zero ID.
+	*/
 	@property bool valid() const {
 		foreach( b; m_bytes )
 			if( b != 0 )
@@ -549,11 +608,15 @@ struct BsonObjectID {
 		return false;
 	}
 
+	/** Allows for relational comparison of different IDs.
+	*/
 	int opCmp(ref const BsonObjectID other) const {
 		if( m_bytes == other.m_bytes) return 0;
 		return m_bytes < other.m_bytes ? -1 : 1;
 	}
 
+	/** Converts the ID to its standard hexa-decimal string representation.
+	*/
 	string toString() const {
 		enum hexdigits = "0123456789abcdef";
 		auto ret = new char[24];
@@ -565,26 +628,29 @@ struct BsonObjectID {
 	}
 }
 
+
+/**
+	Represents a BSON date value (Bson.Type.Date).
+*/
 struct BsonDate {
 	private long m_time; // milliseconds since UTC unix epoch
 
-    this(Date date) {
-        this(SysTime(date));
-    }
+	this(in Date date) {
+		this(SysTime(date));
+	}
 
-    this(DateTime date) {
-        this(SysTime(date));
-    }
+	this(in DateTime date) {
+		this(SysTime(date));
+	}
 
 	this(long time){
 		m_time = time;
 	}
 
-	this(SysTime time){
+	this(in SysTime time){
 		auto zero = unixTimeToStdTime(0);
 		m_time = (time.stdTime() - zero) / 10_000L;
 	}
-
 
 	SysTime toSysTime() const {
 		auto zero = unixTimeToStdTime(0);
@@ -606,6 +672,10 @@ struct BsonDate {
 	@property void value(long v) { m_time = v; }
 }
 
+
+/**
+	Represents a BSON timestamp value (Bson.Type.Timestamp)
+*/
 struct BsonTimestamp {
 	private long m_time;
 
@@ -614,6 +684,10 @@ struct BsonTimestamp {
 	}
 }
 
+
+/**
+	Represents a BSON regular expression value (Bson.Type.Regex).
+*/
 struct BsonRegex {
 	private {
 		string m_expr;
@@ -631,7 +705,34 @@ struct BsonRegex {
 }
 
 
+/**
+	Serializes the given value to BSON.
 
+	The following types of values are supported:
+
+	$(DL
+		$(DT Bson)            $(DD Used as-is)
+		$(DT Json)            $(DD Converted to BSON)
+		$(DT BsonBinData)     $(DD Converted to Bson.Type.BinData)
+		$(DT BsonObjectID)    $(DD Converted to Bson.Type.ObjectID)
+		$(DT BsonDate)        $(DD Converted to Bson.Type.Date)
+		$(DT BsonTimestamp)   $(DD Converted to Bson.Type.Timestamp)
+		$(DT BsonRegex)       $(DD Converted to Bson.Type.Regex)
+		$(DT null)            $(DD Converted to Bson.Type.Null)
+		$(DT bool)            $(DD Converted to Bson.Type.Bool)
+		$(DT float, double)   $(DD Converted to Bson.Type.Double)
+		$(DT short, ushort, int, uint, long, ulong) $(DD Converted to Bson.Type.Long)
+		$(DT string)          $(DD Converted to Bson.Type.String)
+		$(DT ubyte[])         $(DD Converted to Bson.Type.BinData)
+		$(DT T[])             $(DD Converted to Bson.Type.Array)
+		$(DT T[string])       $(DD Converted to Bson.Type.Object)
+		$(DT struct)          $(DD Converted to Bson.Type.Object)
+		$(DT class)           $(DD Converted to Bson.Type.Object or Bson.Type.Null)
+	)
+
+	All entries of an array or an associative array, as well as all R/W properties and
+	all fields of a struct/class are recursively serialized using the same rules.
+*/
 Bson serializeToBson(T)(T value)
 {
 	static if( is(T == Bson) ) return value;
@@ -661,10 +762,9 @@ Bson serializeToBson(T)(T value)
 	} else static if( is(T == struct) ){
 		Bson[string] ret;
 		foreach( m; __traits(allMembers, T) ){
-			static if( __traits(compiles, __traits(getMember, value, m) = __traits(getMember, value, m)) ){
-				auto mn = m;
+			static if( isRWField!(T, m) ){
 				auto mv = __traits(getMember, value, m);
-				ret[mn] = serializeToBson(mv);
+				ret[m] = serializeToBson(mv);
 			}
 		}
 		return Bson(ret);
@@ -672,10 +772,9 @@ Bson serializeToBson(T)(T value)
 		if( value is null ) return Bson(null);
 		Bson[string] ret;
 		foreach( m; __traits(allMembers, T) ){
-			static if( __traits(compiles, __traits(getMember, value, m) = __traits(getMember, value, m)) ){
-				auto mn = m;
+			static if( isRWField!(T, m) ){
 				auto mv = __traits(getMember, value, m);
-				ret[mn] = serializeToBson(mv);
+				ret[m] = serializeToBson(mv);
 			}
 		}
 		return Bson(ret);
@@ -684,6 +783,12 @@ Bson serializeToBson(T)(T value)
 	}
 }
 
+
+/**
+	Deserializes a BSON value into the destination variable.
+
+	The same types as for serializeToBson() are supported and handled inversely.
+*/
 void deserializeBson(T)(ref T dst, Bson src)
 {
 	static if( is(T == Bson) ) dst = src;
@@ -712,18 +817,68 @@ void deserializeBson(T)(ref T dst, Bson src)
 		}
 	} else static if( is(T == struct) ){
 		foreach( m; __traits(allMembers, T) ){
-			static if( __traits(compiles, __traits(getMember, dst, m) = __traits(getMember, dst, m)) )
+			static if( isRWPlainField!(T, m) ){
 				deserializeBson(__traits(getMember, dst, m), src[m]);
+			} else static if( isRWField!(T, m) ){
+				typeof(__traits(getMember, dst, m)) v;
+				deserializeBson(v, src[m]);
+				__traits(getMember, dst, m) = v;
+			}
 		}
 	} else static if( is(T == class) ){
+		if (src.isNull()) return;
 		dst = new T;
 		foreach( m; __traits(allMembers, T) ){
-			static if( __traits(compiles, __traits(getMember, dst, m) = __traits(getMember, dst, m)) )
+			static if( isRWPlainField!(T, m) ){
 				deserializeBson(__traits(getMember, dst, m), src[m]);
+			} else static if( isRWField!(T, m) ){
+				typeof(__traits(getMember, dst, m)) v;
+				deserializeBson(v, src[m]);
+				__traits(getMember, dst, m) = v;
+			}
 		}
 	} else {
 		static assert(false, "Unsupported type '"~T.stringof~"' for JSON serialization.");
 	}
+}
+
+unittest {
+	import std.stdio;
+	static struct S { float a; double b; bool c; int d; string e; byte f; ubyte g; long h; ulong i; float[] j; }
+	S t = {1.5, -3.0, true, int.min, "Test", -128, 255, long.min, ulong.max, [1.1, 1.2, 1.3]};
+	S u;
+	deserializeBson(u, serializeToBson(t));
+	assert(t.a == u.a);
+	assert(t.b == u.b);
+	assert(t.c == u.c);
+	assert(t.d == u.d);
+	assert(t.e == u.e);
+	assert(t.f == u.f);
+	assert(t.g == u.g);
+	assert(t.h == u.h);
+	assert(t.i == u.i);
+	assert(t.j == u.j);
+}
+
+unittest {
+	static class C {
+		int a;
+		private int _b;
+		@property int b() const { return _b; }
+		@property void b(int v) { _b = v; }
+
+		@property int test() const { return 10; }
+
+		void test2() {}
+	}
+	C c = new C;
+	c.a = 1;
+	c.b = 2;
+
+	C d;
+	deserializeBson(d, serializeToBson(c));
+	assert(c.a == d.a);
+	assert(c.b == d.b);
 }
 
 
@@ -784,31 +939,31 @@ private Json bsonToJson(Bson value)
 {
 	switch( value.type ){
 		default: assert(false);
-	    case Bson.Type.Double: return Json(cast(double)value);
-	    case Bson.Type.String: return Json(cast(string)value);
-	    case Bson.Type.Object:
-	    	Json[string] ret;
-	    	foreach( k, v; cast(Bson[string])value )
-	    		ret[k] = bsonToJson(v);
-	    	return Json(ret);
-	    case Bson.Type.Array:
-	    	auto ret = new Json[value.length];
-	    	foreach( i, v; cast(Bson[])value )
-	    		ret[i] = bsonToJson(v);
-	    	return Json(ret);
-	    case Bson.Type.BinData: assert(false, "TODO");
-	    case Bson.Type.ObjectID: return Json((cast(BsonObjectID)value).toString());
-	    case Bson.Type.Bool: return Json(cast(bool)value);
-	    case Bson.Type.Date: return Json((cast(BsonDate)value).m_time);
-	    case Bson.Type.Null: return Json(null);
-	    case Bson.Type.Regex: assert(false, "TODO");
-	    case Bson.Type.DBRef: assert(false, "TODO");
-	    case Bson.Type.Code: return Json(cast(string)value);
-	    case Bson.Type.Symbol: return Json(cast(string)value);
-	    case Bson.Type.CodeWScope: assert(false, "TODO");
-	    case Bson.Type.Int: return Json(cast(int)value);
-	    case Bson.Type.Timestamp: return Json((cast(BsonTimestamp)value).m_time);
-	    case Bson.Type.Long: return Json(cast(long)value);
+		case Bson.Type.Double: return Json(cast(double)value);
+		case Bson.Type.String: return Json(cast(string)value);
+		case Bson.Type.Object:
+			Json[string] ret;
+			foreach( k, v; cast(Bson[string])value )
+				ret[k] = bsonToJson(v);
+			return Json(ret);
+		case Bson.Type.Array:
+			auto ret = new Json[value.length];
+			foreach( i, v; cast(Bson[])value )
+				ret[i] = bsonToJson(v);
+			return Json(ret);
+		case Bson.Type.BinData: assert(false, "TODO");
+		case Bson.Type.ObjectID: return Json((cast(BsonObjectID)value).toString());
+		case Bson.Type.Bool: return Json(cast(bool)value);
+		case Bson.Type.Date: return Json((cast(BsonDate)value).m_time);
+		case Bson.Type.Null: return Json(null);
+		case Bson.Type.Regex: assert(false, "TODO");
+		case Bson.Type.DBRef: assert(false, "TODO");
+		case Bson.Type.Code: return Json(cast(string)value);
+		case Bson.Type.Symbol: return Json(cast(string)value);
+		case Bson.Type.CodeWScope: assert(false, "TODO");
+		case Bson.Type.Int: return Json(cast(int)value);
+		case Bson.Type.Timestamp: return Json((cast(BsonTimestamp)value).m_time);
+		case Bson.Type.Long: return Json(cast(long)value);
 	}
 }
 
@@ -836,7 +991,7 @@ private Bson jsonToBson(Json value)
 
 private string skipCString(ref bdata_t data)
 {
-	auto idx = data.indexOf(0);
+	auto idx = data.countUntil(0);
 	enforce(idx >= 0, "Unterminated BSON C-string.");
 	auto ret = data[0 .. idx];
 	data = data[idx+1 .. $];

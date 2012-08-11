@@ -34,13 +34,15 @@ import std.range;
 import std.string;
 
 struct LevMutex {
-	Mutex mutex;
-	ReadWriteMutex rwmutex;
+	FreeListRef!Mutex mutex;
+	FreeListRef!ReadWriteMutex rwmutex;
+	alias FreeListObjectAlloc!(LevMutex, false, true) Alloc;
 }
 
 struct LevCondition {
-	Condition cond;
+	FreeListRef!Condition cond;
 	LevMutex* mutex;
+	alias FreeListObjectAlloc!(LevCondition, false, true) Alloc;
 }
 
 private extern(C){
@@ -49,13 +51,12 @@ private extern(C){
 	void lev_free(void* p){ free(p); }
 
 	void* lev_alloc_mutex(uint locktype) {
-		auto ret = cast(LevMutex*)calloc(1, LevMutex.sizeof);
-		GC.addRange(ret, LevMutex.sizeof);
-		if( locktype == EVTHREAD_LOCKTYPE_READWRITE ) ret.rwmutex = new ReadWriteMutex;
-		else ret.mutex = new Mutex;
+		auto ret = LevMutex.Alloc.alloc();
+		if( locktype == EVTHREAD_LOCKTYPE_READWRITE ) ret.rwmutex = FreeListRef!ReadWriteMutex();
+		else ret.mutex = FreeListRef!Mutex();
 		return ret;
 	}
-	void lev_free_mutex(void* lock, uint locktype) { GC.removeRange(lock); free(lock); }
+	void lev_free_mutex(void* lock, uint locktype) { LevMutex.Alloc.free(cast(LevMutex*)lock); }
 	int lev_lock_mutex(uint mode, void* lock) {
 		auto mtx = cast(LevMutex*)lock;
 		
@@ -84,12 +85,8 @@ private extern(C){
 		return 0;
 	}
 
-	void* lev_alloc_condition(uint condtype) {
-		auto ret = cast(LevCondition*)calloc(1, LevCondition.sizeof);
-		GC.addRange(ret, LevCondition.sizeof);
-		return ret;
-	}
-	void lev_free_condition(void* cond) { GC.removeRange(cond); free(cond); }
+	void* lev_alloc_condition(uint condtype) { return LevCondition.Alloc.alloc(); }
+	void lev_free_condition(void* cond) { LevCondition.Alloc.free(cast(LevCondition*)cond); }
 	int lev_signal_condition(void* cond, int broadcast) {
 		auto c = cast(LevCondition*)cond;
 		if( c.cond ) c.cond.notifyAll();
@@ -100,7 +97,7 @@ private extern(C){
 		if( c.mutex is null ) c.mutex = cast(LevMutex*)lock;
 		assert(c.mutex.mutex !is null); // RW mutexes are not supported for conditions!
 		assert(c.mutex is lock);
-		if( c.cond is null ) c.cond = new Condition(c.mutex.mutex);
+		if( c.cond is null ) c.cond = FreeListRef!Condition(c.mutex.mutex);
 		if( timeout ){
 			if( !c.cond.wait(dur!"seconds"(timeout.tv_sec) + dur!"usecs"(timeout.tv_usec)) )
 				return 1;
@@ -116,7 +113,7 @@ class Libevent2Driver : EventDriver {
 		DriverCore m_core;
 		event_base* m_eventLoop;
 		evdns_base* m_dnsBase;
-		Libevent2WorkerThread[] m_workerThreads;
+		bool m_exit = false;
 	}
 
 	this(DriverCore core)
@@ -156,11 +153,6 @@ class Libevent2Driver : EventDriver {
 		
 		m_dnsBase = evdns_base_new(m_eventLoop, 1);
 		if( !m_dnsBase ) logError("Failed to initialize DNS lookup.");
-
-		version(MultiThreadTest){
-			foreach( i; 0 .. 4 )
-				startWorkerThread();
-		}
 	}
 
 	~this()
@@ -175,29 +167,30 @@ class Libevent2Driver : EventDriver {
 
 	int runEventLoop()
 	{
-		return event_base_loop(m_eventLoop, 0);
+		int ret;
+		while( !m_exit && (ret = event_base_loop(m_eventLoop, EVLOOP_ONCE)) == 0 )
+			s_driverCore.notifyIdle();
+		return ret;
+	}
+
+	int runEventLoopOnce()
+	{
+		auto ret = event_base_loop(m_eventLoop, EVLOOP_ONCE);
+		m_core.notifyIdle();
+		return ret;
 	}
 
 	int processEvents()
 	{
-		return event_base_loop(m_eventLoop, EVLOOP_ONCE);
+		auto ret = event_base_loop(m_eventLoop, EVLOOP_NONBLOCK);
+		m_core.notifyIdle();
+		return ret;
 	}
 
 	void exitEventLoop()
 	{
+		m_exit = true;
 		enforce(event_base_loopbreak(m_eventLoop) == 0, "Failed to exit libevent event loop.");
-		foreach( loop; m_workerThreads )
-			loop.exit();
-	}
-
-	void runWorkerTask(void delegate() f)
-	{
-		if( m_workerThreads.length == 0 ){
-			runTask(f);
-		} else {
-			// TODO: do some meaningful scheduling!
-			m_workerThreads[0].addTask(f);
-		}
 	}
 
 	FileStream openFile(string path, FileMode mode)
@@ -217,11 +210,9 @@ class Libevent2Driver : EventDriver {
 		auto buf_event = bufferevent_socket_new(m_eventLoop, sockfd, bufferevent_options.BEV_OPT_CLOSE_ON_FREE);
 		if( !buf_event ) throw new Exception("Failed to create buffer event for socket.");
 
-		auto cctx = heap_new!TcpContext(m_core, m_eventLoop, sockfd, buf_event);
-		cctx.task = Fiber.getThis();
+		auto cctx = TcpContext.Alloc.alloc(m_core, m_eventLoop, sockfd, buf_event);
+		cctx.task = Task.getThis();
 		bufferevent_setcb(buf_event, &onSocketRead, &onSocketWrite, &onSocketEvent, cctx);
-		timeval toread = {tv_sec: 60, tv_usec: 0};
-		bufferevent_set_timeouts(buf_event, &toread, null);
 		if( bufferevent_enable(buf_event, EV_READ|EV_WRITE) )
 			throw new Exception("Error enabling buffered I/O event for socket.");
 
@@ -276,12 +267,6 @@ class Libevent2Driver : EventDriver {
 		return new Libevent2Timer(this, callback);
 	}
 
-	private void startWorkerThread()
-	{
-		auto thr = new Libevent2WorkerThread;
-		m_workerThreads ~= thr;
-	}
-
 	private int listenTcpGeneric(SOCKADDR)(int af, SOCKADDR* sock_addr, ushort port, void delegate(TcpConnection conn) connection_callback)
 	{
 		auto listenfd = socket(af, SOCK_STREAM, 0);
@@ -312,7 +297,7 @@ class Libevent2Driver : EventDriver {
 		version(Windows){} else evutil_make_listen_socket_reuseable(listenfd);
 
 		// Add an event to wait for connections
-		auto ctx = heap_new!TcpContext(m_core, m_eventLoop, listenfd, null, *sock_addr);
+		auto ctx = TcpContext.Alloc.alloc(m_core, m_eventLoop, listenfd, null, *sock_addr);
 		ctx.connectionCallback = connection_callback;
 		auto connect_event = event_new(m_eventLoop, listenfd, EV_READ | EV_PERSIST, &onConnect, ctx);
 		if( event_add(connect_event, null) ){
@@ -325,117 +310,11 @@ class Libevent2Driver : EventDriver {
 	}
 }
 
-class Libevent2WorkerThread {
-	private {
-		Thread m_thread;
-		event_base* m_eventLoop;
-		evdns_base* m_dnsBase;
-		void delegate()[] m_taskQueue;
-		Mutex m_taskQueueMutex;
-		event* m_wakeEvent;
-	}
-
-	this()
-	{
-		m_taskQueueMutex = new Mutex;
-		m_thread = new Thread(&workerLoop);
-		m_thread.name = "libevent worker thread";
-		m_thread.start();
-	}
-
-	void exit()
-	{
-		enforce(event_base_loopbreak(m_eventLoop) == 0, "Failed to exit libevent worker loop.");
-	}
-
-	void addTask(void delegate() f)
-	{
-		synchronized(m_taskQueueMutex){
-			m_taskQueue ~= f;
-		}
-		wakeUp();
-	}
-
-	void wakeUp()
-	{
-		event_active(m_wakeEvent, 0, 0);
-	}
-
-	private void workerLoop()
-	{
-		scope(exit) logInfo("Worker thread exit");
-		try {
-			logTrace("creating worker loop");
-			m_eventLoop = event_base_new();
-			if(m_eventLoop is null){
-				logError("Failed to create worker loop.");
-				return;
-			}
-			s_eventLoop = m_eventLoop;
-			logTrace("created worker loop");
-
-			logDebug("libevent worker is using %s for events.", to!string(event_base_get_method(m_eventLoop)));
-			evthread_make_base_notifiable(m_eventLoop);
-
-			logTrace("creating worker dns base");
-			
-			m_dnsBase = evdns_base_new(m_eventLoop, 1);
-			if( !m_dnsBase ) logError("Failed to initialize DNS lookup.");
-
-			logTrace("creating worker wake event");
-
-			m_wakeEvent = event_new(m_eventLoop, -1, EV_PERSIST, &onNewTask, cast(void*)this);
-			if( m_wakeEvent is null ) logDebug("Failed to create dummy event");
-
-			logTrace("adding worker wake event");
-			if( event_add(m_wakeEvent, null) != 0 )
-				logDebug("Failed to add dummy event");
-
-			logDebug("Starting worker loop..");
-			if( auto ret = event_base_loop(m_eventLoop, 0) != 0){
-				logError("Failed to run worker loop: %d", ret);
-				return;
-			}
-			logDebug("Finished worker loop..");
-
-			event_free(m_wakeEvent);
-			evdns_base_free(m_dnsBase, false);
-			event_base_free(m_eventLoop);
-		} catch( Throwable e ){
-			logError("Worker thread failed with uncaught exception: %s", e.toString());
-		}
-	}
-
-	private void runTasks()
-	{
-		while(true){
-			void delegate() task;
-			synchronized(m_taskQueueMutex){
-				if( m_taskQueue.empty ) break;
-				task = m_taskQueue.front;
-				m_taskQueue.popFront();
-			}
-			runTask(task);
-		}
-	}
-
-	private static extern(C) nothrow
-	void onNewTask(evutil_socket_t, short events, void* userptr)
-	{
-		auto thr = cast(Libevent2WorkerThread)userptr;
-		try {
-			thr.runTasks();
-		} catch( Throwable e ){	
-			logError("Error running worker tasks: %s", e.msg);
-		}
-	}
-}
-
 class Libevent2Signal : Signal {
 	private {
 		Libevent2Driver m_driver;
 		event* m_event;
-		bool[Fiber] m_listeners;
+		bool[Task] m_listeners;
 		int m_emitCount = 0;
 	}
 
@@ -459,30 +338,34 @@ class Libevent2Signal : Signal {
 
 	void wait()
 	{
+		wait(m_emitCount);
+	}
+
+	void wait(int reference_emit_count)
+	{
 		assert(!isOwner());
 		auto self = Fiber.getThis();
 		acquire();
 		scope(exit) release();
-		auto start_count = m_emitCount;
-		while( m_emitCount == start_count )
+		while( m_emitCount == reference_emit_count )
 			m_driver.m_core.yieldForEvent();
 	}
 
 	void acquire()
 	{
-		m_listeners[Fiber.getThis()] = true;
+		m_listeners[Task.getThis()] = true;
 	}
 
 	void release()
 	{
-		auto self = Fiber.getThis();
+		auto self = Task.getThis();
 		if( isOwner() )
 			m_listeners.remove(self);
 	}
 
 	bool isOwner()
 	{
-		return (Fiber.getThis() in m_listeners) !is null;
+		return (Task.getThis() in m_listeners) !is null;
 	}
 
 	@property int emitCount() const { return m_emitCount; }
@@ -491,7 +374,7 @@ class Libevent2Signal : Signal {
 class Libevent2Timer : Timer {
 	private {
 		Libevent2Driver m_driver;
-		Fiber m_owner;
+		Task m_owner;
 		void delegate() m_callback;
 		event* m_event;
 		bool m_pending;
@@ -517,7 +400,7 @@ class Libevent2Timer : Timer {
 	void acquire()
 	{
 		assert(m_owner is null);
-		m_owner = Fiber.getThis();
+		m_owner = Task.getThis();
 	}
 
 	void release()
@@ -593,7 +476,7 @@ private extern(C) nothrow
 
 		sig.m_emitCount++;
 
-		bool[Fiber] lst;
+		bool[Task] lst;
 		try {
 			lst = sig.m_listeners.dup;
 			foreach( l, _; lst )

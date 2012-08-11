@@ -7,6 +7,8 @@
 */
 module vibe.inet.url;
 
+import vibe.textfilter.urlencode;
+
 import std.algorithm;
 import std.array;
 import std.conv;
@@ -49,6 +51,7 @@ struct Url {
 			enforce(idx > 0, "No schema in URL:"~str);
 			ret.m_schema = str[0 .. idx];
 			str = str[idx+1 .. $];
+			bool requires_host = false;
 
 			switch(ret.schema){
 				case "http":
@@ -59,6 +62,7 @@ struct Url {
 				case "file":
 					// proto://server/path style
 					enforce(str.startsWith("//"), "URL must start with proto://...");
+					requires_host = true;
 					str = str[2 .. $];
 					goto default;
 				default:
@@ -84,7 +88,8 @@ struct Url {
 						ret.m_host = ret.host[0 .. pi];
 					}
 
-					enforce(ret.schema == "file" || ret.m_host.length > 0, "Empty server name in URL.");
+					enforce(!requires_host || ret.schema == "file" || ret.m_host.length > 0,
+							"Empty server name in URL.");
 					str = str[si .. $];
 			}
 		}
@@ -130,9 +135,10 @@ struct Url {
 	@property string localURI()
 	const { 
 		auto str = appender!string();
-		str.put(path.toString(true));
+		str.reserve(m_pathString.length + 2 + queryString.length + anchor.length);
+		filterUrlEncode(str, path.toString(true), "/");
 		if( queryString.length ) {
-			str.put("&");
+			str.put("?");
 			str.put(queryString);
 		} 
 		if( anchor.length ) {
@@ -157,7 +163,7 @@ struct Url {
 		}
 
 		m_pathString = str;
-		m_path = Path(str);
+		m_path = Path(urlDecode(str));
 	}
 
 	@property Url parentUrl() const {
@@ -190,7 +196,7 @@ struct Url {
 		}
 		dst.put(host);
 		dst.put(localURI);
- 		return dst.data;
+		return dst.data;
 	}
 
 	bool startsWith(const Url rhs) const {
@@ -253,15 +259,9 @@ struct Path {
 	
 	this(string pathstr)
 	{
-		m_absolute = (pathstr.startsWith("/") || pathstr.length >= 2 && pathstr[1] == ':');
 		m_nodes = cast(immutable)splitPath(pathstr);
-		assert(!pathstr.startsWith("/") || m_nodes[0].toString() == "");
-		if( pathstr.startsWith("/") ) m_nodes = m_nodes[1 .. $];
-		if( m_nodes.length > 0 && !m_nodes[$-1].toString().length ){
-			m_endsWithSlash = true;
-			m_nodes = m_nodes[0 .. $-1];
-		}
-		
+		m_absolute = (pathstr.startsWith("/") || m_nodes.length > 0 && m_nodes[0].toString().countUntil(':')>0);
+		m_endsWithSlash = pathstr.endsWith("/");
 		foreach( e; m_nodes ) assert(e.toString().length > 0);
 	}
 	
@@ -362,6 +362,8 @@ struct Path {
 	@property immutable(PathEntry)[] nodes() const { return m_nodes; }
 	@property size_t length() const { return m_nodes.length; }
 	@property bool empty() const { return m_nodes.length == 0; }
+	@property bool endsWithSlash() const { return m_endsWithSlash; }
+	@property void endsWithSlash(bool v) { m_endsWithSlash = v; }
 
 	/// Determines if this path goes outside of its base path (i.e. begins with '..').
 	@property bool external() const { return !m_absolute && m_nodes.length > 0 && m_nodes[0].m_name == ".."; }
@@ -465,8 +467,10 @@ string joinPath(string basepath, string subpath)
 /// Splits up a path string into its elements/folders
 PathEntry[] splitPath(string path)
 {
+	if( path.startsWith("/") ) path = path[1 .. $];
 	if( path.empty ) return null;
-	
+	if( path.endsWith("/") ) path = path[0 .. $-1];
+
 	// count the number of path nodes
 	size_t nelements = 0;
 	foreach( i, char ch; path )
@@ -482,10 +486,12 @@ PathEntry[] splitPath(string path)
 	size_t eidx = 0;
 	foreach( i, char ch; path )
 		if( ch == '\\' || ch == '/' ){
+			enforce(i - startidx > 0, "Empty path entries not allowed.");
 			elements[eidx++] = PathEntry(path[startidx .. i]);
 			startidx = i+1;
 		}
 	elements[eidx++] = PathEntry(path[startidx .. $]);
+	enforce(path.length - startidx > 0, "Empty path entries not allowed.");
 	assert(eidx == nelements);
 	return elements;
 }

@@ -8,17 +8,25 @@
 module vibe.stream.memory;
 
 import vibe.stream.stream;
+import vibe.utils.memory;
 
 import std.array;
+import std.typecons;
+
 
 class MemoryOutputStream : OutputStream {
 	private {
-		Appender!(ubyte[]) m_destination;
+		AllocAppender!(ubyte[]) m_destination;
 	}
 
-	this()
+	this(Allocator alloc = defaultAllocator())
 	{
-		m_destination.clear();
+		m_destination = AllocAppender!(ubyte[])(alloc);
+	}
+
+	void reserve(size_t nbytes)
+	{
+		m_destination.reserve(nbytes);
 	}
 
 	@property ubyte[] data() { return m_destination.data(); }

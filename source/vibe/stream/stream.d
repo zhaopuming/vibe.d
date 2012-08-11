@@ -9,11 +9,13 @@ module vibe.stream.stream;
 
 import vibe.core.log;
 import vibe.stream.memory;
+import vibe.utils.memory;
 
-import std.array;
 import std.algorithm;
-import std.exception;
+import std.array;
 import std.datetime;
+import std.exception;
+import std.typecons;
 
 
 /**************************************************************************************************/
@@ -27,9 +29,9 @@ import std.datetime;
 		An exception if either the stream end was hit without hitting a newline first, or
 		if more than max_bytes have been read from the stream in case of max_bytes != 0.
 */
-ubyte[] readLine(InputStream stream, size_t max_bytes = 0, string linesep = "\r\n") /*@ufcs*/
+ubyte[] readLine(InputStream stream, size_t max_bytes = 0, string linesep = "\r\n", Allocator alloc = defaultAllocator()) /*@ufcs*/
 {
-	return readUntil(stream, cast(const(ubyte)[])linesep, max_bytes);
+	return readUntil(stream, cast(const(ubyte)[])linesep, max_bytes, alloc);
 }
 
 /**
@@ -39,9 +41,10 @@ ubyte[] readLine(InputStream stream, size_t max_bytes = 0, string linesep = "\r\
 		An exception if either the stream end was hit without hitting a marker first, or
 		if more than max_bytes have been read from the stream in case of max_bytes != 0.
 */
-ubyte[] readUntil(InputStream stream, in ubyte[] end_marker, size_t max_bytes = 0) /*@ufcs*/
+ubyte[] readUntil(InputStream stream, in ubyte[] end_marker, size_t max_bytes = 0, Allocator alloc = defaultAllocator()) /*@ufcs*/
 {
-	auto output = new MemoryOutputStream();
+	auto output = scoped!MemoryOutputStream(alloc);
+	output.reserve(max_bytes ? max_bytes < 128 ? max_bytes : 128 : 128);
 	readUntil(stream, output, end_marker, max_bytes);
 	return output.data();
 }
@@ -50,7 +53,8 @@ void readUntil(InputStream stream, OutputStream dst, in ubyte[] end_marker, ulon
 {
 	// TODO: implement a more efficient algorithm for long end_markers such as a Boyer-Moore variant
 	size_t nmatched = 0;
-	ubyte[128] buf;
+	auto bufferobj = FreeListRef!(Buffer, false)();
+	auto buf = bufferobj.bytes[];
 
 	void skip(size_t nbytes)
 	{
@@ -73,24 +77,30 @@ void readUntil(InputStream stream, OutputStream dst, in ubyte[] end_marker, ulon
 			str = buf[0 .. nread];
 		}
 
-		foreach( i, ch; str ){
-			if( ch == end_marker[nmatched] ){
-				nmatched++;
-				if( nmatched == end_marker.length ){
-					skip(i+1-nread);
-					return;
-				}
-			} else {
-				enforce(max_bytes == 0 || bytes_written < max_bytes,
-					"Maximum number of bytes read before reading the end marker.");
-				if( nmatched > 0 ){
-					dst.write(end_marker[0 .. nmatched]);
-					bytes_written += nmatched;
-					nmatched = 0;
-				}
-				dst.write((&ch)[0 .. 1]);
-				bytes_written++;
+		auto mpart = min(end_marker.length - nmatched, str.length);
+		if( str[0 .. mpart] == end_marker[nmatched .. nmatched+mpart] ){
+			nmatched += mpart;
+			if( nmatched == end_marker.length ){
+				skip(mpart-nread);
+				return;
 			}
+		} else {
+			if( nmatched > 0 ){
+				dst.write(end_marker[0 .. nmatched]);
+				nmatched = 0;
+			}
+			foreach( i, ch; str ){
+				if( ch == end_marker[nmatched] ){
+					if( ++nmatched == end_marker.length ){
+						if( i+1 > end_marker.length )
+							dst.write(str[0 .. i+1-end_marker.length]);
+						skip(i+1-nread);
+						return;
+					}
+				} else nmatched = 0;
+			}
+
+			dst.write(str[0 .. str.length-nmatched]);
 		}
 
 		skip(str.length - nread);
@@ -107,7 +117,8 @@ void readUntil(InputStream stream, OutputStream dst, in ubyte[] end_marker, ulon
 ubyte[] readAll(InputStream stream, size_t max_bytes = 0) /*@ufcs*/
 {
 	auto dst = appender!(ubyte[])();
-	auto buffer = new ubyte[64*1024];
+	auto bufferobj = FreeListRef!(Buffer, false)();
+	auto buffer = bufferobj.bytes[];
 	size_t n = 0, m = 0;
 	while( !stream.empty ){
 		enforce(!max_bytes || n++ < max_bytes, "Data too long!");
@@ -119,6 +130,7 @@ ubyte[] readAll(InputStream stream, size_t max_bytes = 0) /*@ufcs*/
 	return dst.data;
 }
 
+private struct Buffer { ubyte[64*1024] bytes; }
 
 /**************************************************************************************************/
 /* Public types                                                                                   */
@@ -194,7 +206,10 @@ interface OutputStream {
 
 	protected final void writeDefault(InputStream stream, ulong nbytes = 0, bool do_flush = true)
 	{
-		auto buffer = new ubyte[64*1024];
+		static struct Buffer { ubyte[64*1024] bytes; }
+		auto bufferobj = FreeListRef!(Buffer, false)();
+		auto buffer = bufferobj.bytes[];
+
 		logTrace("default write %d bytes, empty=%s", nbytes, stream.empty);
 		if( nbytes == 0 ){
 			while( !stream.empty ){

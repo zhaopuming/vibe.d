@@ -25,18 +25,17 @@ interface EventDriver {
 	*/
 	int runEventLoop();
 
-	/** Processes all outstanding events, potentially blocking until the first event comes
-		available.
+	/* Processes all outstanding events, potentially blocking to wait for the first event.
+	*/
+	int runEventLoopOnce();
+
+	/** Processes all outstanding events if any, does not block.
 	*/
 	int processEvents();
 
 	/** Exits any running event loop.
 	*/
 	void exitEventLoop();
-
-	/** Passes the given task to a worker thread and executes it
-	*/
-	void runWorkerTask(void delegate() f);
 
 	/** Opens a file on disk with the speficied file mode.
 	*/
@@ -71,7 +70,17 @@ interface EventDriver {
 */
 interface DriverCore {
 	void yieldForEvent();
-	void resumeTask(Fiber f, Exception event_exception = null);
+	void resumeTask(Task f, Exception event_exception = null);
+	void notifyIdle();
+}
+
+class Task : Fiber {
+	protected this(void delegate() fun, size_t stack_size)
+	{
+		super(fun);
+	}
+
+	static Task getThis(){ return cast(Task)Fiber.getThis(); }
 }
 
 
@@ -100,6 +109,14 @@ interface EventedObject {
 interface TcpConnection : Stream, EventedObject {
 	/// Used to disable Nagle's algorithm
 	@property void tcpNoDelay(bool enabled);
+	/// ditto
+	@property bool tcpNoDelay() const;
+
+	/// Controls the read time out after which the connection is closed automatically
+	@property void readTimeout(Duration duration)
+		in { assert(duration >= dur!"seconds"(0)); }
+	/// ditto
+	@property Duration readTimeout() const;
 
 	/// Actively closes the connection.
 	void close();
@@ -119,6 +136,7 @@ interface TcpConnection : Stream, EventedObject {
 */
 enum FileMode {
 	Read,
+	ReadWrite,
 	CreateTrunc,
 	Append
 }
@@ -144,6 +162,9 @@ interface FileStream : Stream, EventedObject {
 
 	/// Seeks to a specific position in the file if supported by the stream.
 	void seek(ulong offset);
+
+	/// Returns the current offset of the file pointer
+	ulong tell();
 }
 
 /** A cross-fiber signal
@@ -154,6 +175,7 @@ interface Signal : EventedObject {
 	@property int emitCount() const;
 	void emit();
 	void wait();
+	void wait(int reference_emit_count);
 }
 
 /**

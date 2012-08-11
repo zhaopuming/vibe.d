@@ -11,6 +11,7 @@ public import std.string;
 
 import std.algorithm;
 import std.array;
+import std.format;
 import std.uni;
 import std.utf;
 import core.exception;
@@ -24,6 +25,7 @@ string sanitizeUTF8(in ubyte[] str)
 {
 	import std.utf;
 	auto ret = appender!string();
+	ret.reserve(str.length);
 
 	size_t i = 0;
 	while( i < str.length ){
@@ -55,7 +57,13 @@ string stripUTF8Bom(string str)
 */
 string joinLines(string[] strs, string linesep = "\n")
 {
+	auto len = 0;
+	foreach( i, s; strs ){
+		if( i > 0 ) len += linesep.length;
+		len += s.length;
+	}
 	auto ret = appender!string();
+	ret.reserve(len);
 	foreach( i, s; strs ){
 		if( i > 0 ) ret.put(linesep);
 		ret.put(s);
@@ -95,21 +103,61 @@ bool isAlpha(char ch)
 	return true;
 }
 
+string stripLeftA(string s)
+{
+	while( s.length > 0 && (s[0] == ' ' || s[0] == '\t') )
+		s = s[1 .. $];
+	return s;
+}
+
+string stripRightA(string s)
+{
+	while( s.length > 0 && (s[$-1] == ' ' || s[$-1] == '\t') )
+		s = s[0 .. $-1];
+	return s;
+}
+
+string stripA(string s)
+{
+	return stripLeftA(stripRightA(s));
+}
+
+sizediff_t countUntilAny(string str, string chars)
+{
+	foreach( i, char ch; str )
+		if( chars.countUntil(ch) >= 0 )
+			return i;
+	return -1;
+}
+
+string formatString(ARGS...)(string format, ARGS args)
+{
+	auto dst = appender!string();
+	formattedWrite(dst, format, args);
+	return dst.data;
+}
+
 int icmp2(string a, string b)
 {
 	size_t i = 0, j = 0;
-	while( i < a.length && j < b.length ){
-		char ac = a[i];
-		char bc = b[i];
-		if( ac < 128 && bc < 128 ){
+	
+	// fast skip equal prefix
+	size_t min_len = min(a.length, b.length);
+	while( i < min_len && a[i] == b[i] ) i++;
+	if( i > 0 && (a[i-1] & 0x80) ) i--; // don't stop half-way in a UTF-8 sequence
+	j = i;
+
+	// compare the differing character and the rest of the string
+	while(i < a.length && j < b.length){
+		uint ac = cast(uint)a[i];
+		uint bc = cast(uint)b[j];
+		if( !((ac | bc) & 0x80) ){
 			i++;
 			j++;
-			if( ac != bc ){
-				if( ac >= 'A' && ac <= 'Z' ) ac += 'a' - 'A';
-				if( bc >= 'A' && bc <= 'Z' ) bc += 'a' - 'A';
-				if( ac < bc ) return -1;
-				else if( ac > bc ) return 1;
-			}
+			if( ac >= 'A' && ac <= 'Z' ) ac += 'a' - 'A';
+			if( bc >= 'A' && bc <= 'Z' ) bc += 'a' - 'A';
+			if( ac < bc ) return -1;
+			else if( ac > bc ) return 1;
 		} else {
 			dchar acp = decode(a, i);
 			dchar bcp = decode(b, j);
@@ -124,5 +172,7 @@ int icmp2(string a, string b)
 
 	if( i < a.length ) return 1;
 	else if( j < b.length ) return -1;
+
+	assert(i == a.length || j == b.length, "Strings equal but we didn't fully compare them!?");
 	return 0;
 }

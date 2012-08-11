@@ -17,54 +17,94 @@ import std.array;
 import std.conv;
 
 
-bool isProt(Json n, string prot){ return ("protection" in n ? n.protection.get!string : "public") == prot; }
-string multi(string word){ return word[$-1] == 's' ? word ~ "es" : word ~ "s"; }
+private bool isProt(Json n, string prot){ return ("protection" in n ? n.protection.get!string : "public") == prot; }
+private string multi(string word){ return word[$-1] == 's' ? word ~ "es" : word ~ "s"; }
 
+/**
+	Determines if a DDOCsteroids node contains a certain kind of child.
+*/
 bool isKind(string kind, Json n){ return n.kind == kind; }
+/// ditto
 Json[] getItemsForKind(string prot, string kind, Json n){ Json[] ret; foreach( dg; n.members[multi(kind)].opt!(Json[]) ) ret ~= dg.get!(Json[]); return ret; }
+/// ditto
 bool hasItemsForKind(string prot, string kind, Json n){ return (multi(kind) in n.members) !is null; }
 
+/// ditto
 bool isFunction(Json n){ return isKind("function", n); }
+/// ditto
 Json[] functions(Json n, string prot = "public"){ return getItemsForKind(prot, "function", n); }
+/// ditto
 bool hasFunctions(Json n, string prot = "public"){ return hasItemsForKind(prot, "function", n); }
 
+/// ditto
 bool isConstructor(Json n){ return isKind("constructor", n); }
+/// ditto
 Json[] constructors(Json n, string prot = "public"){ return getItemsForKind(prot, "constructor", n); }
+/// ditto
 bool hasConstructors(Json n, string prot = "public"){ return hasItemsForKind(prot, "constructor", n); }
 
+/// ditto
 bool isInterface(Json n){ return isKind("interface", n); }
+/// ditto
 Json[] interfaces(Json n, string prot = "public"){ return getItemsForKind(prot, "interface", n); }
+/// ditto
 bool hasInterfaces(Json n, string prot = "public"){ return hasItemsForKind(prot, "interface", n); }
 
+/// ditto
 bool isClass(Json n){ return isKind("class", n); }
+/// ditto
 Json[] classes(Json n, string prot = "public"){ return getItemsForKind(prot, "class", n); }
+/// ditto
 bool hasClasses(Json n, string prot = "public"){ return hasItemsForKind(prot, "class", n); }
 
+/// ditto
 bool isStruct(Json n){ return isKind("struct", n); }
+/// ditto
 Json[] structs(Json n, string prot = "public"){ return getItemsForKind(prot, "struct", n); }
+/// ditto
 bool hasStructs(Json n, string prot = "public"){ return hasItemsForKind(prot, "struct", n); }
 
+/// ditto
 bool isEnum(Json n){ return isKind("enum", n); }
+/// ditto
 Json[] enums(Json n, string prot = "public"){ return getItemsForKind(prot, "enum", n); }
+/// ditto
 bool hasEnums(Json n, string prot = "public"){ return hasItemsForKind(prot, "enum", n); }
 
+/// ditto
 bool isAlias(Json n){ return isKind("alias", n); }
+/// ditto
 Json[] aliases(Json n, string prot = "public"){ return getItemsForKind(prot, "alias", n); }
+/// ditto
 bool hasAliases(Json n, string prot = "public"){ return hasItemsForKind(prot, "alias", n); }
 
+/// ditto
 bool isVariable(Json n){ return isKind("variable", n); }
+/// ditto
 Json[] variables(Json n, string prot = "public"){ return getItemsForKind(prot, "variable", n); }
+/// ditto
 bool hasVariables(Json n, string prot = "public"){ return hasItemsForKind(prot, "variable", n); }
 
 
-string formatDdocComment(Json ddoc_, int hlevel = 2, bool delegate(string) display_section = null)
+/**
+	Takes a DDOC string and outputs formatted HTML.
+
+	The hlevel parameter specifies the header level used for section names (&lt;h2&gt by default).
+	By specifying a display_section callback it is also possible to output only certain sections.
+*/
+string formatDdocComment(string ddoc_, int hlevel = 2, bool delegate(string) display_section = null)
 {
-	if( ddoc_.type != Json.Type.String ) return null;
 	auto dst = appender!string();
 	filterDdocComment(dst, cast(string)ddoc_, hlevel, display_section);
 	return dst.data;
 }
-
+/// ditto
+string formatDdocComment(Json ddoc_, int hlevel = 2, bool delegate(string) display_section = null)
+{
+	if( ddoc_.type != Json.Type.String ) return null;
+	return formatDdocComment(ddoc_.get!string, hlevel, display_section);
+}
+/// ditto
 void filterDdocComment(R)(ref R dst, string ddoc, int hlevel = 2, bool delegate(string) display_section = null)
 {
 	auto lines = splitLines(ddoc);
@@ -139,10 +179,7 @@ void filterDdocComment(R)(ref R dst, string ddoc, int hlevel = 2, bool delegate(
 			case TEXT:
 				dst.put("<p>");
 				auto j = skipBlock(i);
-				foreach( ln; lines[i .. j] ){
-					renderTextLine(dst, ln, macros);
-					dst.put("\n");
-				}
+				renderTextLine(dst, lines[i .. j].join("\n"), macros);
 				dst.put("</p>\n");
 				i = j;
 				break;
@@ -192,6 +229,7 @@ void filterDdocComment(R)(ref R dst, string ddoc, int hlevel = 2, bool delegate(
 	}
 }
 
+/// private
 private void renderTextLine(R)(ref R dst, string line, string[string] macros, string[] params = null)
 {
 	while( line.length > 0 ){
@@ -228,18 +266,44 @@ private void renderTextLine(R)(ref R dst, string line, string[string] macros, st
 			}
 			line = line[1 .. $];
 		} else if( line[0] == '(' ){
-			auto cidx = line.countUntil(')');
-			if( cidx < 0 ) continue;
-			auto args = splitParams(line[1 .. cidx]);
-			logDebug("PARAMS: %s", args);
-			logDebug("MACROS: %s", macros);
-			line = line[cidx+1 .. $];
-
-			if( args.length < 1 ) continue;
-
-			if( auto pm = args[0] in macros ){
-				renderTextLine(dst, *pm, macros, args[1 .. $]);
+			line = line[1 .. $];
+			int l = 1;
+			size_t cidx = 0;
+			for( cidx = 0; cidx < line.length && l > 0; cidx++ ){
+				if( line[cidx] == '(' ) l++;
+				else if( line[cidx] == ')' ) l--;
 			}
+			if( l > 0 ){
+				logDebug("Unmatched parenthesis in DDOC comment.");
+				continue;
+			}
+			if( cidx < 1 ){
+				logDebug("Missing macro name in DDOC comment.");
+				continue;
+			}
+
+			auto mnameidx = line[0 .. cidx-1].countUntilAny(" \t\r\n");
+
+			if( mnameidx < 0 ){
+				logDebug("Macro call in DDOC comment is missing macro name.");
+				continue;
+			}
+			auto mname = line[0 .. mnameidx];
+
+			auto argstext = appender!string();
+			string[] args;
+			if( mnameidx+1 < cidx ){
+				renderTextLine(argstext, line[mnameidx+1 .. cidx-1], macros, params);
+				args = splitParams(argstext.data());
+			}
+
+			logTrace("PARAMS: (%s) %s", mname, args);
+			logTrace("MACROS: %s", macros);
+			line = line[cidx .. $];
+
+			if( auto pm = mname in macros )
+				renderTextLine(dst, *pm, macros, args);
+			else logDebug("Macro '%s' not found.", mname);
 		}
 	}
 }

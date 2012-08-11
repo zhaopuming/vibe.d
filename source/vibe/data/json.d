@@ -9,9 +9,12 @@ module vibe.data.json;
 
 public import vibe.stream.stream;
 
+import vibe.data.utils;
+
 import std.array;
 import std.conv;
 import std.exception;
+import std.format;
 import std.string;
 import std.range;
 import std.traits;
@@ -32,23 +35,6 @@ import std.traits;
 	required to convert a JSON value to the corresponding static D type.
 */
 struct Json {
-	/** Represents the run time type of a JSON value.
-	*/
-	enum Type {
-		Undefined,
-		Null,
-		Bool,
-		Int,
-		Float,
-		String,
-		Array,
-		Object
-	}
-
-	static @property Json Undefined() { return Json(); }
-	static @property Json EmptyObject() { return Json(cast(Json[string])null); }
-	static @property Json EmptyArray() { return Json(cast(Json[])null); }
-
 	private {
 		union {
 			bool m_bool;
@@ -60,6 +46,37 @@ struct Json {
 		};
 		Type m_type = Type.Undefined;
 	}
+
+	/** Represents the run time type of a JSON value.
+	*/
+	enum Type {
+		/// A non-existent value in a JSON object
+		Undefined,
+		/// Null value
+		Null,
+		/// Boolean value
+		Bool,
+		/// 64-bit integer value
+		Int,
+		/// 64-bit floating point value
+		Float,
+		/// UTF-8 string
+		String,
+		/// Array of JSON values
+		Array,
+		/// JSON object aka. dictionary from string to Json
+		Object
+	}
+
+	/// New JSON value of Type.Undefined
+	static @property Json Undefined() { return Json(); }
+
+	/// New JSON value of Type.Object
+	static @property Json EmptyObject() { return Json(cast(Json[string])null); }
+
+	/// New JSON value of Type.Array
+	static @property Json EmptyArray() { return Json(cast(Json[])null); }
+
 	version(JsonLineNumbers) int line;
 
 	/**
@@ -604,7 +621,10 @@ struct Json {
 /******************************************************************************/
 
 /**
-	Parses the given range as a JSON string and returns the corresponding JSON object.
+	Parses the given range as a JSON string and returns the corresponding Json object.
+
+	The range is shrunk during parsing, leaving any remaining text that is now part of
+	the JSON contents.
 
 	Throws an Exception if any parsing error occured.
 */
@@ -689,7 +709,51 @@ Json parseJson(R)(ref R range, int* line = null)
 	return ret;
 }
 
+/**
+	Parses the given JSON string and returns the corresponding Json object.
+	
+	Throws an Exception if any parsing error occurs.
+*/
+Json parseJsonString(string str)
+{
+	auto ret = parseJson(str);
+	enforce(str.strip().length == 0, "Expected end of string after JSON value.");
+	return ret;
+}
 
+unittest {
+	assert(parseJsonString("null") == Json(null));
+	assert(parseJsonString("true") == Json(true));
+	assert(parseJsonString("false") == Json(false));
+	assert(parseJsonString("1") == Json(1));
+	assert(parseJsonString("2.0") == Json(2.0));
+	assert(parseJsonString("\"test\"") == Json("test"));
+	assert(parseJsonString("[1, 2, 3]") == Json([Json(1), Json(2), Json(3)]));
+	assert(parseJsonString("{\"a\": 1}") == Json(["a": Json(1)]));
+}
+
+
+/**
+	Serializes the given value to JSON.
+
+	The following types of values are supported:
+
+	$(DL
+		$(DT Json)            $(DD Used as-is)
+		$(DT null)            $(DD Converted to Bson.Type.Null)
+		$(DT bool)            $(DD Converted to Bson.Type.Bool)
+		$(DT float, double)   $(DD Converted to Bson.Type.Double)
+		$(DT short, ushort, int, uint, long, ulong) $(DD Converted to Bson.Type.Int)
+		$(DT string)          $(DD Converted to Bson.Type.String)
+		$(DT T[])             $(DD Converted to Bson.Type.Array)
+		$(DT T[string])       $(DD Converted to Bson.Type.Object)
+		$(DT struct)          $(DD Converted to Bson.Type.Object)
+		$(DT class)           $(DD Converted to Bson.Type.Object or Bson.Type.Null)
+	)
+
+	All entries of an array or an associative array, as well as all R/W properties and
+	all fields of a struct/class are recursively serialized using the same rules.
+*/
 Json serializeToJson(T)(T value)
 {
 	static if( is(T == Json) ) return value;
@@ -709,13 +773,14 @@ Json serializeToJson(T)(T value)
 		foreach( string key, value; value )
 			ret[key] = serializeToJson(value);
 		return Json(ret);
+	} else static if( __traits(compiles, value = T.fromString(value.toString())) ){
+		return Json(value.toString());
 	} else static if( is(T == struct) ){
 		Json[string] ret;
 		foreach( m; __traits(allMembers, T) ){
-			static if( __traits(compiles, __traits(getMember, value, m) = __traits(getMember, value, m)) ){
-				auto mn = m;
+			static if( isRWField!(T, m) ){
 				auto mv = __traits(getMember, value, m);
-				ret[mn] = serializeToJson(mv);
+				ret[m] = serializeToJson(mv);
 			}
 		}
 		return Json(ret);
@@ -723,10 +788,9 @@ Json serializeToJson(T)(T value)
 		if( value is null ) return Json(null);
 		Json[string] ret;
 		foreach( m; __traits(allMembers, T) ){
-			static if( __traits(compiles, __traits(getMember, value, m) = __traits(getMember, value, m)) ){
-				auto mn = m;
+			static if( isRWField!(T, m) ){
 				auto mv = __traits(getMember, value, m);
-				ret[mn] = serializeToJson(mv);
+				ret[m] = serializeToJson(mv);
 			}
 		}
 		return Json(ret);
@@ -735,13 +799,19 @@ Json serializeToJson(T)(T value)
 	}
 }
 
+
+/**
+	Deserializes a JSON value into the destination variable.
+
+	The same types as for serializeToJson() are supported and handled inversely.
+*/
 void deserializeJson(T)(ref T dst, Json src)
 {
 	static if( is(T == Json) ) dst = src;
 	else static if( is(T == typeof(null)) ){ }
 	else static if( is(T == bool) ) dst = src.get!bool;
-	else static if( is(T == float) ) dst = src.get!float;
-	else static if( is(T == double) ) dst = src.get!double;
+	else static if( is(T == float) ) dst = src.to!float;   // since doubles are frequently serialized without
+	else static if( is(T == double) ) dst = src.to!double; // a decimal point, we allow conversions here
 	else static if( is(T : long) ) dst = cast(T)src.get!long;
 	else static if( is(T == string) ) dst = src.get!string;
 	else static if( isArray!T ){
@@ -754,23 +824,74 @@ void deserializeJson(T)(ref T dst, Json src)
 			deserializeJson(val, value);
 			dst[key] = val;
 		}
+	} else static if( __traits(compiles, dst = T.fromString(dst.toString())) ){
+		dst = T.fromString(src.get!string);
 	} else static if( is(T == struct) ){
 		foreach( m; __traits(allMembers, T) ){
-			auto mn = m;
-			static if( __traits(compiles, __traits(getMember, value, m) = __traits(getMember, value, m)) )
-				deserializeJson(__traits(getMember, value, m), value[mn]);
+			static if( isRWPlainField!(T, m) ){
+				deserializeJson(__traits(getMember, dst, m), src[m]);
+			} else static if( isRWField!(T, m) ){
+				typeof(__traits(getMember, dst, m)) v;
+				deserializeJson(v, src[m]);
+				__traits(getMember, dst, m) = v;
+			}
 		}
 	} else static if( is(T == class) ){
+		if( src.type == Json.Type.Null ) return;
 		dst = new T;
 		foreach( m; __traits(allMembers, T) ){
-			auto mn = m;
-			static if( __traits(compiles, __traits(getMember, value, m) = __traits(getMember, value, m)) )
-				deserializeJson(__traits(getMember, value, m), value[mn]);
+			static if( isRWPlainField!(T, m) ){
+				deserializeJson(__traits(getMember, dst, m), src[m]);
+			} else static if( isRWField!(T, m) ){
+				typeof(__traits(getMember, dst, m)()) v;
+				deserializeJson(v, src[m]);
+				__traits(getMember, dst, m) = v;
+			}
 		}
 	} else {
 		static assert(false, "Unsupported type '"~T.stringof~"' for JSON serialization.");
 	}
 }
+
+unittest {
+	import std.stdio;
+	static struct S { float a; double b; bool c; int d; string e; byte f; ubyte g; long h; ulong i; float[] j; }
+	S t = {1.5, -3.0, true, int.min, "Test", -128, 255, long.min, ulong.max, [1.1, 1.2, 1.3]};
+	S u;
+	deserializeJson(u, serializeToJson(t));
+	assert(t.a == u.a);
+	assert(t.b == u.b);
+	assert(t.c == u.c);
+	assert(t.d == u.d);
+	assert(t.e == u.e);
+	assert(t.f == u.f);
+	assert(t.g == u.g);
+	assert(t.h == u.h);
+	assert(t.i == u.i);
+	assert(t.j == u.j);
+}
+
+unittest {
+	static class C {
+		int a;
+		private int _b;
+		@property int b() const { return _b; }
+		@property void b(int v) { _b = v; }
+
+		@property int test() const { return 10; }
+
+		void test2() {}
+	}
+	C c = new C;
+	c.a = 1;
+	c.b = 2;
+
+	C d;
+	deserializeJson(d, serializeToJson(c));
+	assert(c.a == d.a);
+	assert(c.b == d.b);
+}
+
 
 /**
 	Writes the given JSON object as a JSON string into the destination range.
@@ -787,8 +908,8 @@ void toJson(R)(ref R dst, in Json json)
 		case Json.Type.Undefined: dst.put("undefined"); break;
 		case Json.Type.Null: dst.put("null"); break;
 		case Json.Type.Bool: dst.put(cast(bool)json ? "true" : "false"); break;
-		case Json.Type.Int: dst.put(to!string(cast(long)json)); break;
-		case Json.Type.Float: dst.put(to!string(cast(double)json)); break;
+		case Json.Type.Int: formattedWrite(dst, "%d", json.get!long); break;
+		case Json.Type.Float: formattedWrite(dst, "%.16g", json.get!double); break;
 		case Json.Type.String:
 			dst.put("\"");
 			jsonEscape(dst, cast(string)json);
@@ -819,15 +940,15 @@ void toJson(R)(ref R dst, in Json json)
 }
 
 /// ditto
-void toPrettyJson(R)(ref R dst, ref const(Json) json, int level = 0)
+void toPrettyJson(R)(ref R dst, in Json json, int level = 0)
 //	if( isOutputRange!R && is(ElementEncodingType!R == char) )
 {
 	final switch( json.type ){
 		case Json.Type.Undefined: dst.put("undefined"); break;
 		case Json.Type.Null: dst.put("null"); break;
 		case Json.Type.Bool: dst.put(cast(bool)json ? "true" : "false"); break;
-		case Json.Type.Int: dst.put(to!string(cast(long)json)); break;
-		case Json.Type.Float: dst.put(to!string(cast(double)json)); break;
+		case Json.Type.Int: formattedWrite(dst, "%d", json.get!long); break;
+		case Json.Type.Float: formattedWrite(dst, "%.16g", json.get!double); break;
 		case Json.Type.String:
 			dst.put("\"");
 			jsonEscape(dst, cast(string)json);

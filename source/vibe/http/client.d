@@ -37,12 +37,12 @@ import std.string;
 	The 'requester' parameter allows to customize the request and to specify the request body for
 	non-GET requests.
 */
-HttpClientResponse requestHttp(string url, void delegate(HttpClientRequest req) requester = null)
+HttpClientResponse requestHttp(string url, scope void delegate(HttpClientRequest req) requester = null)
 {
 	return requestHttp(Url.parse(url), requester);
 }
 /// ditto
-HttpClientResponse requestHttp(Url url, void delegate(HttpClientRequest req) requester = null)
+HttpClientResponse requestHttp(Url url, scope void delegate(HttpClientRequest req) requester = null)
 {
 	enforce(url.schema == "http" || url.schema == "https", "Url schema must be http(s).");
 	enforce(url.host.length > 0, "Url must contain a host name.");
@@ -50,7 +50,7 @@ HttpClientResponse requestHttp(Url url, void delegate(HttpClientRequest req) req
 	bool ssl = url.schema == "https";
 	auto cli = connectHttp(url.host, url.port, ssl);
 	auto res = cli.request((req){
-			req.url = url.path.toString();
+			req.url = url.localURI;
 			req.headers["Host"] = url.host;
 			if( requester ) requester(req);
 		});
@@ -130,7 +130,7 @@ class HttpClient : EventedObject {
 		}
 	}
 
-	HttpClientResponse request(void delegate(HttpClientRequest req) requester)
+	HttpClientResponse request(scope void delegate(HttpClientRequest req) requester)
 	{
 		if( !m_conn || !m_conn.connected ){
 			m_conn = connectTcp(m_server, m_port);
@@ -173,7 +173,7 @@ class HttpClient : EventedObject {
 		parseRfc5322Header(m_stream, res.headers, MaxHttpHeaderLineLength);
 
 		// prepare body the reader
-		if( req.method == "HEAD" ){
+		if( req.method == HttpMethod.HEAD ){
 			res.bodyReader = new LimitedInputStream(null, 0);
 		} else {
 			if( auto pte = "Transfer-Encoding" in res.headers ){
@@ -248,7 +248,7 @@ final class HttpClientRequest : HttpRequest {
 	private void writeHeader()
 	{
 		auto app = appender!string();
-		formattedWrite(app, "%s %s %s\r\n", method, url, getHttpVersionString(httpVersion));
+		formattedWrite(app, "%s %s %s\r\n", httpMethodString(method), url, getHttpVersionString(httpVersion));
 		m_conn.write(app.data, false);
 		
 		foreach( k, v; headers ){

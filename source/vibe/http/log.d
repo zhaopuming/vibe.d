@@ -88,10 +88,11 @@ string formatApacheLog(string format, HttpServerRequest req, HttpServerResponse 
 	string statusStr;
 	string key = "";
 	auto ln = appender!string();
+	ln.reserve(500);
 	while( format.length > 0 ) {
 		final switch(state) {
 			case State.Init:
-				auto idx = format.indexOf("%");
+				auto idx = format.countUntil('%');
 				if( idx < 0 ) {
 					ln.put( format );
 					format = "";
@@ -141,7 +142,7 @@ string formatApacheLog(string format, HttpServerRequest req, HttpServerResponse 
 				}
 				break;
 			case State.Key:
-				auto idx = format.indexOf("}");
+				auto idx = format.countUntil('}');
 				enforce(idx > -1, "Missing '}'");
 				key = format[0 .. idx];
 				format = format[idx+1 .. $];
@@ -186,7 +187,7 @@ string formatApacheLog(string format, HttpServerRequest req, HttpServerResponse 
 						else ln.put("-");
 						break;
 					case 'm': //Request method
-						ln.put(req.method);
+						ln.put(httpMethodString(req.method));
 						break;
 					case 'o': //Response header {header}						
 						enforce(key, "header name missing");
@@ -201,7 +202,7 @@ string formatApacheLog(string format, HttpServerRequest req, HttpServerResponse 
 						ln.put("?" ~ req.queryString);
 						break;
 					case 'r': //First line of Request
-						ln.put(req.method ~ " " ~ req.url ~ " " ~ getHttpVersionString(req.httpVersion));
+						ln.put(httpMethodString(req.method) ~ " " ~ req.url ~ " " ~ getHttpVersionString(req.httpVersion));
 						break;
 					case 's': //Status
 						ln.put(to!string(res.statusCode));
