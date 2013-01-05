@@ -11,7 +11,7 @@ import vibe.core.log;
 import vibe.core.file;
 import vibe.http.client;
 import vibe.inet.url;
-import vibe.stream.stream;
+import vibe.core.stream;
 
 import std.exception;
 import std.string;
@@ -43,13 +43,13 @@ InputStream download(string url_, HttpClient client = null)
 
 		switch( res.statusCode ){
 			default:
-				throw new Exception("Server reponded with code: "~httpStatusText(res.statusCode));
+				throw new Exception("Server responded with "~httpStatusText(res.statusCode)~" for "~url_);
 			case HttpStatus.OK:
 				return res.bodyReader;
 			case 300: .. case 400:
 	logTrace("Status code: %s", res.statusCode);
 				auto pv = "Location" in res.headers;
-				enforce(pv !is null, "Server reponded with redirect but did not specify the redirect location.");
+				enforce(pv !is null, "Server responded with redirect but did not specify the redirect location for "~url_);
 				logDebug("Redirect to '%s'", *pv);
 				if( startsWith((*pv), "http:") || startsWith((*pv), "https:") ){
 	logTrace("parsing %s", *pv);
@@ -63,10 +63,22 @@ InputStream download(string url_, HttpClient client = null)
 }
 
 /// ditto
+InputStream download(Url url, HttpClient client = null)
+{
+	return download(url.toString(), client);
+}
+
+/// ditto
 void download(string url, string filename)
 {
 	auto input = download(url);
 	auto fil = openFile(filename, FileMode.CreateTrunc);
 	scope(exit) fil.close();
 	fil.write(input);
+}
+
+/// ditto
+void download(Url url, Path filename)
+{
+	download(url.toString(), filename.toNativeString());
 }

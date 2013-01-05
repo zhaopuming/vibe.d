@@ -10,7 +10,7 @@ module vibe.db.mongo.connection;
 public import vibe.data.bson;
 
 import vibe.core.log;
-import vibe.core.tcp;
+import vibe.core.net;
 
 import std.algorithm;
 import std.array;
@@ -18,6 +18,7 @@ import std.conv;
 import std.exception;
 import std.regex;
 import std.string;
+
 
 /**
 	Provides low-level mongodb protocol access.
@@ -101,7 +102,7 @@ class MongoConnection : EventedObject {
 		send(msg);
 		if(settings.safe)
 		{
-			safeModeLastError(collection_name);
+			checkForError(collection_name);
 		}
 	}
 
@@ -119,7 +120,7 @@ class MongoConnection : EventedObject {
 		
 		if(settings.safe)
 		{
-			safeModeLastError(collection_name);
+			checkForError(collection_name);
 		}
 	}
 
@@ -159,7 +160,7 @@ class MongoConnection : EventedObject {
 		send(msg);
 		if(settings.safe)
 		{
-			safeModeLastError(collection_name);
+			checkForError(collection_name);
 		}
 	}
 
@@ -201,7 +202,7 @@ class MongoConnection : EventedObject {
 		} else if( m_bytesRead - bytes_read > msglen ){
 			logWarn("MongoDB reply was shorter than expected. Dropping connection.");
 			disconnect();
-			throw new Exception("MongoDB reply was too short for data.");
+			throw new MongoException("MongoDB reply was too short for data.");
 		}
 
 		auto msg = new Reply;
@@ -249,9 +250,11 @@ class MongoConnection : EventedObject {
 
 	private int nextMessageId() { return m_msgid++; }
 	
-	private Reply safeModeLastError(string collection_name)
+	private void checkForError(string collection_name)
 	{
-		Bson[string] command_and_options = ["getlasterror": Bson(1)];
+		auto coll = collection_name.split(".")[0] ~ ".$cmd";
+
+		Bson[string] command_and_options = ["getlasterror": Bson(1.0)];
 		
 		if(settings.w != settings.w.init)
 			command_and_options["w"] = settings.w; // Already a Bson struct
@@ -262,11 +265,19 @@ class MongoConnection : EventedObject {
 		if(settings.fsync)
 			command_and_options["fsync"] = Bson(true);
 		
-		logTrace("Running safeModeLastError on %s", collection_name);
-			
-		Reply results = query(collection_name, QueryFlags.None | settings.defQueryFlags,
-										0, 0, serializeToBson(command_and_options));	
-		return results;
+		Reply results = query(coll, QueryFlags.None | settings.defQueryFlags,
+										0, 1, serializeToBson(command_and_options));	
+		enforce(!(results.flags & ReplyFlags.QueryFailure), new MongoException("MongoDB error: getLastError call failed."));
+
+		logTrace("error result flags for %s: %s, cursor %s, documents %s", coll, results.flags, results.cursor, results.documents.length);
+
+		if( results.documents.length == 0 )
+			return;
+
+		enforce(results.documents.length == 1, new MongoException("getLastError returned "~to!string(results.documents.length)~" documents instead of one!?"));
+		auto res = results.documents[0];
+
+		enforce(res.err.type == Bson.Type.Null, new MongoException("MongoDB getLastError error: "~res.err.get!string()));
 	}
 }
 
@@ -294,7 +305,7 @@ bool parseMongoDBUrl(out MongoClientSettings cfg, string url)
 	}
 
 	// Reslice to get rid of 'mongodb://'
-    tmpUrl = tmpUrl[10..$];
+	tmpUrl = tmpUrl[10..$];
 		
 	auto slashIndex = countUntil(tmpUrl, "/");
 	if( slashIndex == -1 ) slashIndex = tmpUrl.length; 
@@ -473,7 +484,7 @@ unittest
 	assert(cfg.hosts[0].port == 27017);
 	
 	cfg = MongoClientSettings.init;		
-	assert(parseMongoDBUrl(cfg, "mongodb://host1,host2,host3/?safe=true&w=2&wtimeoutMS=2000&slaveOk=false"));
+	assert(parseMongoDBUrl(cfg, "mongodb://host1,host2,host3/?safe=true&w=2&wtimeoutMS=2000&slaveOk=true"));
 	assert(cfg.username == "");
 	assert(cfg.password == "");
 	assert(cfg.database == "");
@@ -485,14 +496,14 @@ unittest
 	assert(cfg.hosts[2].name == "host3");
 	assert(cfg.hosts[2].port == 27017);
 	assert(cfg.safe == true);
-	assert(cfg.w == Bson(2));
+	assert(cfg.w == Bson(2L));
 	assert(cfg.wTimeoutMS == 2000);
 	assert(cfg.defQueryFlags == QueryFlags.SlaveOk);
 	
 	cfg = MongoClientSettings.init;		
 	assert(parseMongoDBUrl(cfg, 
 		"mongodb://fred:flinstone@host1.example.com,host2.other.example.com:27108,host3:"
-		"27019/mydb?journal=true;fsync=true;connectMS=1500;sockettimeoutMs=1000;w=majority"));
+		"27019/mydb?journal=true;fsync=true;connectTimeoutms=1500;sockettimeoutMs=1000;w=majority"));
 	assert(cfg.username == "fred");
 	assert(cfg.password == "flinstone");
 	assert(cfg.database == "mydb");
@@ -502,7 +513,7 @@ unittest
 	assert(cfg.hosts[1].name == "host2.other.example.com");
 	assert(cfg.hosts[1].port == 27108);
 	assert(cfg.hosts[2].name == "host3");
-	assert(cfg.hosts[2].port == 27019);assert(cfg.fsync == false);
+	assert(cfg.hosts[2].port == 27019);
 	assert(cfg.fsync == true);
 	assert(cfg.journal == true);
 	assert(cfg.connectTimeoutMS == 1500);
@@ -618,5 +629,12 @@ class MongoHost
 	{
 		name = hostName;
 		port = mongoPort;
+	}
+}
+
+class MongoException : Exception {
+	this(string message, Throwable next = null, string file = __FILE__, int line = __LINE__)
+	{
+		super(message, file, line, next);
 	}
 }

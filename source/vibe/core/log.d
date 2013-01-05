@@ -18,6 +18,7 @@ import core.thread;
 private {
 	shared LogLevel s_minLevel = LogLevel.Info;
 	shared LogLevel s_logFileLevel;
+	shared bool s_plainLogging = false;
 	FileStream s_logFile;
 }
 
@@ -25,6 +26,12 @@ private {
 void setLogLevel(LogLevel level) nothrow
 {
 	s_minLevel = level;
+}
+
+/// Disables output of thread/task ids with each log message
+void setPlainLogging(bool enable)
+{
+	s_plainLogging = enable;
 }
 
 /// Sets a log file for disk logging
@@ -41,18 +48,18 @@ void setLogFile(string filename, LogLevel min_level = LogLevel.Error)
 		level = The log level for the logged message
 		fmt = See http://dlang.org/phobos/std_format.html#format-string
 */
-void logTrace(T...)(string fmt, T args) nothrow { log(LogLevel.Trace, fmt, args); }
+void logTrace(T...)(string fmt, auto ref T args) nothrow { log(LogLevel.Trace, fmt, args); }
 /// ditto
-void logDebug(T...)(string fmt, T args) nothrow { log(LogLevel.Debug, fmt, args); }
+void logDebug(T...)(string fmt, auto ref T args) nothrow { log(LogLevel.Debug, fmt, args); }
 /// ditto
-void logInfo(T...)(string fmt, T args) nothrow { log(LogLevel.Info, fmt, args); }
+void logInfo(T...)(string fmt, auto ref T args) nothrow { log(LogLevel.Info, fmt, args); }
 /// ditto
-void logWarn(T...)(string fmt, T args) nothrow { log(LogLevel.Warn, fmt, args); }
+void logWarn(T...)(string fmt, auto ref T args) nothrow { log(LogLevel.Warn, fmt, args); }
 /// ditto
-void logError(T...)(string fmt, T args) nothrow { log(LogLevel.Error, fmt, args); }
+void logError(T...)(string fmt, auto ref T args) nothrow { log(LogLevel.Error, fmt, args); }
 
 /// ditto
-void log(T...)(LogLevel level, string fmt, T args)
+void log(T...)(LogLevel level, string fmt, auto ref T args)
 nothrow {
 	if( level < s_minLevel && (level < s_logFileLevel || !s_logFile) ) return;
 	string pref;
@@ -77,7 +84,8 @@ nothrow {
 		fiberid ^= fiberid >> 32;
 
 		if( level >= s_minLevel ){
-			writefln("[%08X:%08X %s] %s", threadid, fiberid, pref, txt.data());
+			if( s_plainLogging ) writeln(txt.data());
+			else writefln("[%08X:%08X %s] %s", threadid, fiberid, pref, txt.data());
 			stdout.flush();
 		}
 

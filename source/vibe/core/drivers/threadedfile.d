@@ -40,18 +40,22 @@ version(Windows){
 		
 		enum O_RDONLY = 0;
 		enum O_WRONLY = 1;
-	    enum O_APPEND = 8;
-	    enum O_CREAT = 0x0100;
-	    enum O_TRUNC = 0x0200;
+		enum O_APPEND = 8;
+		enum O_CREAT = 0x0100;
+		enum O_TRUNC = 0x0200;
+		enum O_BINARY = 0x8000;
 
 		enum _S_IREAD = 0x0100;          /* read permission, owner */
 		enum _S_IWRITE = 0x0080;          /* write permission, owner */
 		alias struct_stat stat_t;
 	}
 }
+else
+{
+	enum O_BINARY = 0;
+}
 
 private {
-	enum O_BINARY = 0x8000;
 	enum SEEK_SET = 0;
 	enum SEEK_CUR = 1;
 	enum SEEK_END = 2;
@@ -66,27 +70,28 @@ class ThreadedFileStream : FileStream {
 		FileMode m_mode;
 	}
 	
-	this(string path, FileMode mode)
+	this(Path path, FileMode mode)
 	{
-		m_path = Path(path);
+		m_path = path;
 		m_mode = mode;
+		auto pathstr = m_path.toString();
 		final switch(m_mode){
 			case FileMode.Read:
-				m_fileDescriptor = open(path.toStringz(), O_RDONLY|O_BINARY);
+				m_fileDescriptor = open(pathstr.toStringz(), O_RDONLY|O_BINARY);
 				break;
 			case FileMode.ReadWrite:
-				m_fileDescriptor = open(path.toStringz(), O_BINARY);
+				m_fileDescriptor = open(pathstr.toStringz(), O_BINARY);
 				break;
 			case FileMode.CreateTrunc:
-				m_fileDescriptor = open(path.toStringz(), O_WRONLY|O_CREAT|O_TRUNC|O_BINARY, octal!644);
+				m_fileDescriptor = open(pathstr.toStringz(), O_WRONLY|O_CREAT|O_TRUNC|O_BINARY, octal!644);
 				break;
 			case FileMode.Append:
-				m_fileDescriptor = open(path.toStringz(), O_WRONLY|O_CREAT|O_APPEND|O_BINARY, octal!644);
+				m_fileDescriptor = open(pathstr.toStringz(), O_WRONLY|O_CREAT|O_APPEND|O_BINARY, octal!644);
 				break;
 		}
 		if( m_fileDescriptor < 0 )
-			//throw new Exception(formatString("Failed to open '%s' with %s: %d", path, cast(int)mode, errno));
-			throw new Exception("Failed to open "~path);
+			//throw new Exception(formatString("Failed to open '%s' with %s: %d", pathstr, cast(int)mode, errno));
+			throw new Exception("Failed to open "~pathstr);
 		
 			
 		version(linux){
@@ -100,12 +105,12 @@ class ThreadedFileStream : FileStream {
 			// (at least) on windows, the created file is write protected
 			version(Windows){
 				if( mode == FileMode.CreateTrunc )
-					chmod(path.toStringz(), S_IREAD|S_IWRITE);
+					chmod(pathstr.toStringz(), S_IREAD|S_IWRITE);
 			}
 		}
 		lseek(m_fileDescriptor, 0, SEEK_SET);
 		
-		logDebug("opened file %s with %d bytes as %d", path, m_size, m_fileDescriptor);
+		logDebug("opened file %s with %d bytes as %d", pathstr, m_size, m_fileDescriptor);
 	}
 
 	~this()
@@ -163,8 +168,9 @@ class ThreadedFileStream : FileStream {
 	void read(ubyte[] dst)
 	{
 		assert(this.readable);
+		assert(dst.length <= int.max);
 		enforce(dst.length <= leastSize);
-		enforce(.read(m_fileDescriptor, dst.ptr, dst.length) == dst.length, "Failed to read data from disk.");
+		enforce(.read(m_fileDescriptor, dst.ptr, cast(int)dst.length) == dst.length, "Failed to read data from disk.");
 		m_ptr += dst.length;
 	}
 
@@ -172,7 +178,8 @@ class ThreadedFileStream : FileStream {
 	void write(in ubyte[] bytes, bool do_flush = true)
 	{
 		assert(this.writable);
-		enforce(.write(m_fileDescriptor, bytes.ptr, bytes.length) == bytes.length, "Failed to write data to disk.");
+		assert(bytes.length <= int.max);
+		enforce(.write(m_fileDescriptor, bytes.ptr, cast(int)bytes.length) == bytes.length, "Failed to write data to disk.");
 		m_ptr += bytes.length;
 	}
 

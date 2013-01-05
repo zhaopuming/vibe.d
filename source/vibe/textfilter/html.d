@@ -11,12 +11,9 @@ import std.array;
 import std.conv;
 import std.range;
 
-private struct StringAppender {
-	string data;
-	void put(string s) { data ~= s; }
-	void put(char ch) { data ~= ch; }
-}
 
+/** Returns the HTML escaped version of a given string.
+*/
 string htmlEscape(string str)
 {
 	if( __ctfe ){ // appender is a performance/memory hog in ctfe
@@ -30,12 +27,17 @@ string htmlEscape(string str)
 	}
 }
 
+
+/** Writes the HTML escaped version of a given string to an output range.
+*/
 void filterHtmlEscape(R)(ref R dst, string str)
 {
 	foreach( dchar ch; str )
-		filterHtmlEscape(dst, ch, false);
+		filterHtmlEscape(dst, ch, HtmlEscapeFlags.escapeNewline);
 }
 
+/** Returns the HTML escaped version of a given string (also escapes double quotes).
+*/
 string htmlAttribEscape(string str)
 {
 	if( __ctfe ){ // appender is a performance/memory hog in ctfe
@@ -49,13 +51,17 @@ string htmlAttribEscape(string str)
 	}
 }
 
+/** Writes the HTML escaped version of a given string to an output range (also escapes double quotes).
+*/
 void filterHtmlAttribEscape(R)(ref R dst, string str)
 {
 	foreach( dchar ch; str )
-		filterHtmlEscape(dst, ch, true);
+		filterHtmlEscape(dst, ch, HtmlEscapeFlags.escapeNewline|HtmlEscapeFlags.escapeQuotes);
 }
 
-string filterHtmlAllEscape()(string str)
+/** Returns the HTML escaped version of a given string (escapes every character).
+*/
+string htmlAllEscape()(string str)
 {
 	if( __ctfe ){ // appender is a performance/memory hog in ctfe
 		StringAppender dst;
@@ -68,6 +74,8 @@ string filterHtmlAllEscape()(string str)
 	}
 }
 
+/** Writes the HTML escaped version of a given string to an output range (escapes every character).
+*/
 void filterHtmlAllEscape(R)(ref R dst, string str)
 {
 	foreach( dchar ch; str ){
@@ -77,24 +85,49 @@ void filterHtmlAllEscape(R)(ref R dst, string str)
 	}
 }
 
-void filterHtmlEscape(R)(ref R dst, dchar ch, bool escape_quotes = false)
+
+/**
+	Minimally escapes a text so that no HTML tags appear in it.
+*/
+string htmlEscapeMin(string str)
+{
+	auto dst = appender!string();
+	foreach( dchar ch; str )
+		filterHtmlEscape(dst, ch, HtmlEscapeFlags.escapeMinimal);
+	return dst.data();
+}
+
+
+/**
+	Writes the HTML escaped version of a character to an output range.
+*/
+void filterHtmlEscape(R)(ref R dst, dchar ch, HtmlEscapeFlags flags = HtmlEscapeFlags.escapeNewline )
 {
 	switch(ch){
 		default:
-			dst.put("&#");
-			dst.put(to!string(cast(int)ch)); 
-			dst.put(';');
+			if( flags & HtmlEscapeFlags.escapeUnknown ){
+				dst.put("&#");
+				dst.put(to!string(cast(int)ch)); 
+				dst.put(';');
+			} else dst.put(ch);
 			break;
 		case '"':
-			if( escape_quotes ) dst.put("&quot;");
+			if( flags & HtmlEscapeFlags.escapeQuotes ) dst.put("&quot;");
 			else dst.put('"');
 			break;
+		case '\r', '\n':
+			if( flags & HtmlEscapeFlags.escapeNewline ){
+				dst.put("&#");
+				dst.put(to!string(cast(int)ch)); 
+				dst.put(';');
+			} else dst.put(ch);
+			break; 
 		case 'a': .. case 'z': goto case;
 		case 'A': .. case 'Z': goto case;
 		case '0': .. case '9': goto case;
 		case ' ', '\t', '-', '_', '.', ':', ',', ';',
 		     '#', '+', '*', '?', '=', '(', ')', '/', '!',
-		     '%' , '{', '}', '[', ']':
+		     '%' , '{', '}', '[', ']', '`', '´', '$', '^', '~':
 		    dst.put(cast(char)ch);
 			break;
 		case '<': dst.put("&lt;"); break;
@@ -103,3 +136,21 @@ void filterHtmlEscape(R)(ref R dst, dchar ch, bool escape_quotes = false)
 	}
 }
 
+
+enum HtmlEscapeFlags {
+	escapeMinimal = 0,
+	escapeQuotes = 1<<0,
+	escapeNewline = 1<<1,
+	escapeUnknown = 1<<2
+}
+
+private struct StringAppender {
+	string data;
+	void put(string s) { data ~= s; }
+	void put(char ch) { data ~= ch; }
+	void put(dchar ch) {
+		import std.utf;
+		char[4] dst;
+		data ~= dst[0 .. encode(dst, ch)];
+	}
+}

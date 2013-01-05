@@ -8,7 +8,7 @@
 */
 module vibe.stream.counting;
 
-public import vibe.stream.stream;
+public import vibe.core.stream;
 
 import std.exception;
 
@@ -39,11 +39,12 @@ class LimitedInputStream : InputStream {
 		m_silentLimit = silent_limit;
 	}
 
+	/// The stream that is wrapped by this one
 	@property inout(InputStream) sourceStream() inout { return m_input; }
 
 	@property bool empty() { return m_silentLimit ? m_input.empty : m_sizeLimit == 0; }
 
-	@property ulong leastSize() { return m_silentLimit ? m_input.leastSize : m_sizeLimit; }
+	@property ulong leastSize() { if( m_silentLimit ) return m_input.leastSize; return m_sizeLimit; }
 
 	@property bool dataAvailableForRead() { return m_input.dataAvailableForRead; }
 
@@ -57,7 +58,7 @@ class LimitedInputStream : InputStream {
 	}
 	
 	protected void onSizeLimitReached() {
-		throw new Exception("Size limit reached");
+		throw new LimitException("Size limit reached", m_sizeLimit);
 	}
 }
 
@@ -119,4 +120,16 @@ class CountingInputStream : InputStream {
 		m_in.read(dst);
 		m_bytesRead += dst.length;
 	}
+}
+
+class LimitException : Exception {
+	private ulong m_limit;
+
+	this(string message, ulong limit, Throwable next = null, string file = __FILE__, int line = __LINE__)
+	{
+		super(message, next, file, line);
+	}
+
+	/// The byte limit of the stream that emitted the exception
+	@property ulong limit() const { return m_limit; }
 }

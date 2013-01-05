@@ -15,8 +15,10 @@ import vibe.inet.url;
 import vibe.textfilter.urlencode;
 import vibe.utils.string;
 
+import std.algorithm : filter;
 import std.array;
 import std.conv;
+import std.exception;
 import std.string;
 import std.traits;
 
@@ -121,21 +123,21 @@ import std.traits;
 
 	See_Also:
 	
-		RestInterfaceClient class for a seemless way to acces such a generated API
+		RestInterfaceClient class for a seamless way to acces such a generated API
 */
 void registerRestInterface(T)(UrlRouter router, T instance, string url_prefix = "/",
 		MethodStyle style = MethodStyle.LowerUnderscored)
 {
-	void addRoute(HttpMethod http_verb, string url, HttpServerRequestDelegate handler)
+	void addRoute(HttpMethod http_verb, string url, HttpServerRequestDelegate handler, string[] params)
 	{
 		router.addRoute(http_verb, url, handler);
-		logDebug("REST route: %s %s", http_verb, url);
+		logDebug("REST route: %s %s %s", http_verb, url, params.filter!(p => !p.startsWith("_") && p != "id")().array());
 	}
 
 	foreach( method; __traits(allMembers, T) ){
 		foreach( overload; MemberFunctionsTuple!(T, method) ){
 			alias ReturnType!overload RetType;
-			auto param_names = parameterNames!(typeof(&overload))();
+			auto param_names = parameterNames!overload();
 			HttpMethod http_verb;
 			string rest_name;
 			getRestMethodName!(typeof(&overload))(method, http_verb, rest_name);
@@ -144,40 +146,16 @@ void registerRestInterface(T)(UrlRouter router, T instance, string url_prefix = 
 				static assert(ParameterTypeTuple!overload.length == 0, "Interfaces may only be returned from parameter-less functions!");
 				registerRestInterface!RetType(router, __traits(getMember, instance, method)(), url_prefix ~ rest_name_adj ~ "/");
 			} else {
-				auto handler = jsonMethodHandler!(T, method, typeof(&overload))(instance);
+				auto handler = jsonMethodHandler!(T, method, overload)(instance);
 				string id_supplement;
 				size_t skip = 0;
 				string url;
 				if( param_names.length && param_names[0] == "id" ){
-					addRoute(http_verb, url_prefix ~ ":id/" ~ rest_name_adj, handler);
+					addRoute(http_verb, url_prefix ~ ":id/" ~ rest_name_adj, handler, param_names);
 					if( rest_name_adj.length == 0 )
-						addRoute(http_verb, url_prefix ~ ":id", handler);
-				} else addRoute	(http_verb, url_prefix ~ rest_name_adj, handler);
+						addRoute(http_verb, url_prefix ~ ":id", handler, param_names);
+				} else addRoute(http_verb, url_prefix ~ rest_name_adj, handler, param_names);
 			}
-		}
-	}
-}
-
-/**
-	Generates a form based interface to the given instance.
-
-	Each function is callable with either GET or POST using form encoded parameters. Complex
-	parameters are encoded as JSON strings.
-
-	Note that this function is currently not fully implemented.
-*/
-void registerFormInterface(I)(UrlRouter router, I instance, string url_prefix,
-		MethodStyle style = MethodStyle.Unaltered)
-{
-	string url(string name){
-		return url_prefix ~ adjustMethodStyle(name, style);
-	}
-
-	foreach( method; __traits(allMembers, T) ){
-		foreach( overload; MemberFunctionsTuple!(T, method) ){
-			auto handler = formMethodHandler(overload);
-			router.get(url(method), handler);
-			router.post(url(method), handler);
 		}
 	}
 }
@@ -225,6 +203,10 @@ void registerFormInterface(I)(UrlRouter router, I instance, string url_prefix,
 */
 class RestInterfaceClient(I) : I
 {
+	//pragma(msg, "imports for "~I.stringof~":");
+	//pragma(msg, generateModuleImports!(I)());
+    mixin(generateModuleImports!I);
+
 	alias void delegate(HttpClientRequest req) RequestFilter;
 	private {
 		Url m_baseUrl;
@@ -234,13 +216,15 @@ class RestInterfaceClient(I) : I
 
 	alias I BaseInterface;
 
+	/** Creates a new REST implementation of I
+	*/
 	this(string base_url, MethodStyle style = MethodStyle.LowerUnderscored)
 	{
 		m_baseUrl = Url.parse(base_url);
 		m_methodStyle = style;
 		mixin(generateRestInterfaceSubInterfaceInstances!I);
 	}
-
+	/// ditto
 	this(Url base_url, MethodStyle style = MethodStyle.LowerUnderscored)
 	{
 		m_baseUrl = base_url;
@@ -248,19 +232,26 @@ class RestInterfaceClient(I) : I
 		mixin(generateRestInterfaceSubInterfaceInstances!I);
 	}
 
+	/** An optional request filter that allows to modify each request before it is made.
+	*/
 	@property RequestFilter requestFilter() { return m_requestFilter; }
+	/// ditto
 	@property void requestFilter(RequestFilter v) {
 		m_requestFilter = v;
 		mixin(generateRestInterfaceSubInterfaceRequestFilter!I);
 	}
 
 	//pragma(msg, generateRestInterfaceSubInterfaces!(I)());
+	#line 1 "subinterfaces"
 	mixin(generateRestInterfaceSubInterfaces!(I));
 
+	//pragma(msg, "restinterface:");
 	//pragma(msg, generateRestInterfaceMethods!(I)());
+	#line 1 "restinterface"
 	mixin(generateRestInterfaceMethods!(I));
 
-	protected Json request(string verb, string name, Json params)
+	#line 253 "rest.d"
+	protected Json request(string verb, string name, Json params, bool[string] param_is_json)
 	const {
 		Url url = m_baseUrl;
 		if( name.length ) url ~= Path(name);
@@ -278,9 +269,7 @@ class RestInterfaceClient(I) : I
 				else first = false;
 				filterUrlEncode(queryString, pname);
 				queryString.put('=');
-				auto valapp = appender!string();
-				toJson(valapp, p);
-				filterUrlEncode(queryString, valapp.data());
+				filterUrlEncode(queryString, param_is_json[pname] ? p.toString() : toRestString(p));
 			}
 			url.queryString = queryString.data();
 		}
@@ -350,35 +339,38 @@ enum MethodStyle {
 
 
 /// private
-private HttpServerRequestDelegate jsonMethodHandler(T, string method, FT)(T inst)
+private HttpServerRequestDelegate jsonMethodHandler(T, string method, alias FUNC)(T inst)
 {
-	alias ParameterTypeTuple!(FT) ParameterTypes;
-	alias ReturnType!(FT) RetType;
+	alias ParameterTypeTuple!FUNC ParameterTypes;
+	alias ReturnType!FUNC RetType;
 
 	void handler(HttpServerRequest req, HttpServerResponse res)
 	{
-		auto jparams = req.json;
 		ParameterTypes params;
 
-		static immutable param_names = parameterNames!FT();
+		static immutable param_names = parameterNames!FUNC();
 		foreach( i, P; ParameterTypes ){
 			static if( i == 0 && param_names[i] == "id" ){
-				static if( __traits(compiles, P.fromString("")) )
-					params[i] = P.fromString(req.params["id"]);
-				else
-					params[i] = to!P(req.params["id"]);
+				logDebug("id %s", req.params["id"]);
+				params[i] = fromRestString!P(req.params["id"]);
 			} else static if( param_names[i].startsWith("_") ){
-				static if( __traits(compiles, P.fromString("")) )
-					params[i] = P.fromString(req.params[param_names[i][1 .. $]]);
-				else
-					params[i] = to!P(req.params[param_names[i][1 .. $]]);
+				static if( param_names[i] != "_dummy"){
+					enforce(param_names[i][1 .. $] in req.params, "req.param[\""~param_names[i][1 .. $]~"\"] was not set!");
+					logDebug("param %s %s", param_names[i], req.params[param_names[i][1 .. $]]);
+					params[i] = fromRestString!P(req.params[param_names[i][1 .. $]]);
+				}
 			} else {
 				if( req.method == HttpMethod.GET ){
 					logDebug("query %s of %s" ,param_names[i], req.query);
-					deserializeJson(params[i], parseJson(req.query[param_names[i]]));
+					enforce(param_names[i] in req.query, "Missing query parameter '"~param_names[i]~"'");
+					params[i] = fromRestString!P(req.query[param_names[i]]);
 				} else {
 					logDebug("%s %s", method, param_names[i]);
-					deserializeJson(params[i], jparams[param_names[i]]);
+					enforce(req.headers["Content-Type"] == "application/json", "The Content-Type header needs to be set to application/json.");
+					enforce(req.json.type != Json.Type.Undefined, "The request body does not contain a valid JSON value.");
+					enforce(req.json.type == Json.Type.Object, "The request body must contain a JSON object with an entry for each parameter.");
+					enforce(req.json[param_names[i]].type != Json.Type.Undefined, "Missing parameter "~param_names[i]~".");
+					params[i] = deserializeJson!P(req.json[param_names[i]]);
 				}
 			}
 		}
@@ -401,14 +393,28 @@ private HttpServerRequestDelegate jsonMethodHandler(T, string method, FT)(T inst
 }
 
 /// private
-private HttpServerRequestDelegate formMethodHandler(T)(T func)
+private @property string generateModuleImports(I)()
 {
-	void handler(HttpServerRequest req, HttpServerResponse res)
-	{
-		assert(false, "TODO!");
+	bool[string] visited;
+	string ret;
+
+	void addModule(string mod){
+		if( mod !in visited ){
+			ret ~= "static import "~mod~";\n";
+			visited[mod] = true;
+		}
 	}
 
-	return &handler;
+	foreach( method; __traits(allMembers, I) )
+		foreach( overload; MemberFunctionsTuple!(I, method) ){
+			static if( __traits(compiles, moduleName!(ReturnType!overload)))
+				addModule(moduleName!(ReturnType!overload));
+			foreach( P; ParameterTypeTuple!overload )
+				static if( __traits(compiles, moduleName!(P)))
+					addModule(moduleName!(P));
+		}
+
+	return ret;
 }
 
 /// private
@@ -495,11 +501,11 @@ private @property string generateRestInterfaceMethods(I)()
 
 	foreach( method; __traits(allMembers, I) ){
 		foreach( overload; MemberFunctionsTuple!(I, method) ){
-			alias typeof(&overload) FT;
+			alias overload FT;
 			alias ParameterTypeTuple!FT PTypes;
 			alias ReturnType!FT RT;
 
-			auto param_names = parameterNames!FT();
+			enum param_names = parameterNames!FT();
 			HttpMethod http_verb; 
 			string rest_name;
 			getRestMethodName!FT(method, http_verb, rest_name);
@@ -521,21 +527,22 @@ private @property string generateRestInterfaceMethods(I)()
 			} else {
 				ret ~= " {\n";
 				ret ~= "\tJson jparams__ = Json.EmptyObject;\n";
+				ret ~= "\tbool[string] jparamsj__;\n";
 
 				// serialize all parameters
 				string path_supplement;
 				foreach( i, PT; PTypes ){
-					if( i == 0 && param_names[0] == "id" ){
-						path_supplement = "to!string(id)~\"/\"~";
-						continue;
+					static if( i == 0 && param_names[0] == "id" ){
+						static if( is(PT == Json) ) path_supplement = "urlEncode(id.toString())~\"/\"~";
+						else path_supplement = "urlEncode(toRestString(serializeToJson(id)))~\"/\"~";
+					} else static if( !param_names[i].startsWith("_") ){
+						// underscore parameters are sourced from the HttpServerRequest.params map
+						ret ~= "\tjparams__[\""~param_names[i]~"\"] = serializeToJson("~param_names[i]~");\n";
+						ret ~= "\tjparamsj__[\""~param_names[i]~"\"] = "~(is(PT == Json) ? "true" : "false")~";\n";
 					}
-					// underscore parameters are sourced from the HttpServerRequest.params map
-					if( param_names[i].startsWith("_") ) continue;
-
-					ret ~= "\tjparams__[\""~param_names[i]~"\"] = serializeToJson("~param_names[i]~");\n";
 				}
 
-				ret ~= "\tauto jret__ = request(\""~ httpMethodString(http_verb)~"\", "~path_supplement~"adjustMethodStyle(\""~rest_name~"\", m_methodStyle), jparams__);\n";
+				ret ~= "\tauto jret__ = request(\""~ httpMethodString(http_verb)~"\", "~path_supplement~"adjustMethodStyle(\""~rest_name~"\", m_methodStyle), jparams__, jparamsj__);\n";
 				static if( !is(RT == void) ){
 					ret ~= "\t"~getReturnTypeString!(overload)~" ret__;\n";
 					ret ~= "\tdeserializeJson(ret__, jret__);\n";
@@ -550,23 +557,216 @@ private @property string generateRestInterfaceMethods(I)()
 }
 
 /// private
-private @property string getReturnTypeString(alias F)()
+// https://github.com/D-Programming-Language/phobos/pull/862
+private template returnsRef(alias f)
 {
-	static void testTempl(T)(){ mixin(T.stringof~" x;"); }
+	enum bool returnsRef = is(typeof(
+	{
+		ParameterTypeTuple!f param;
+		auto ptr = &f(param);
+	}));
+}
+
+/// private
+private @property string getReturnTypeString(alias F)()
+{   
 	alias ReturnType!F T;
-	static if( is(T == void) || __traits(compiles, testTempl!T) )
-	   return T.stringof;
-	else return "ReturnType!(typeof(&BaseInterface."~__traits(identifier, F)~"))";
+	static if (returnsRef!F)	
+		return "ref " ~ fullyQualifiedTypeName!T;
+	else
+		return fullyQualifiedTypeName!T;
 }
 
 /// private
 private @property string getParameterTypeString(alias F, int i)()
 {
-	static void testTempl(T)(){ mixin(T.stringof~" x;"); }
-	alias ParameterTypeTuple!(F)[i] T;
-	static if( is(T == void) || __traits(compiles, testTempl!T) )
-		return T.stringof;
-	else return "ParameterTypeTuple!(typeof(&BaseInterface."~__traits(identifier, F)~"))["~to!string(i)~"]";
+	alias ParameterTypeTuple!(F) T;
+	alias ParameterStorageClassTuple!(F) storage_classes;
+	static assert(T.length > i);
+	static assert(storage_classes.length > i);
+
+	enum is_ref = (storage_classes[i] & ParameterStorageClass.ref_);
+	enum is_out = (storage_classes[i] & ParameterStorageClass.out_);
+	enum is_lazy = (storage_classes[i] & ParameterStorageClass.lazy_);
+	enum is_scope = (storage_classes[i] & ParameterStorageClass.scope_);
+
+	string prefix = "";
+	if (is_ref)
+		prefix = "ref " ~ prefix;
+	if (is_out)
+		prefix = "out " ~ prefix;
+	if (is_lazy)
+		prefix = "lazy " ~ prefix;
+	if (is_scope)
+		prefix = "scope " ~ prefix;
+
+	return prefix ~ fullyQualifiedTypeName!(T[i]);
+}
+
+/// private
+private template fullyQualifiedTypeNameImpl(T,
+    bool already_const, bool already_immutable, bool already_shared)
+{
+	import std.typetuple;
+	
+    // Convinience tags
+    enum {
+        _const = 0,
+        _immutable = 1,
+        _shared = 2
+    }
+    
+    alias TypeTuple!(is(T == const), is(T == immutable), is(T == shared)) qualifiers;
+    alias TypeTuple!(false, false, false) no_qualifiers;
+
+    template parametersTypeString(T)
+    {
+        import std.array;
+        import std.algorithm;
+
+        alias ParameterTypeTuple!(T) parameters;
+        enum parametersTypeString = join([staticMap!(fullyQualifiedTypeName, parameters)], ", ");
+    }
+
+    template addQualifiers(string type_string,
+        bool add_const, bool add_immutable, bool add_shared)
+    {
+        static if (add_const)
+            enum addQualifiers = addQualifiers!("const(" ~ type_string ~ ")",
+                false, add_immutable, add_shared);
+        else static if (add_immutable)
+            enum addQualifiers = addQualifiers!("immutable(" ~ type_string ~ ")",
+                add_const, false, add_shared);
+        else static if (add_shared)
+            enum addQualifiers = addQualifiers!("shared(" ~ type_string ~ ")",
+                add_const, add_immutable, false);
+        else
+            enum addQualifiers = type_string;
+    }
+
+    // Convenience template to avoid copy-paste
+    template chain(string current)
+    {
+        enum chain = addQualifiers!(current,
+            qualifiers[_const]     && !already_const,
+            qualifiers[_immutable] && !already_immutable,
+            qualifiers[_shared]    && !already_shared);
+    }
+    
+    static if (isBasicType!T || is(T == enum))
+    {   
+        enum fullyQualifiedTypeNameImpl = chain!((Unqual!T).stringof);
+    }   
+    else static if (isAggregateType!T)
+    {   
+        enum fullyQualifiedTypeNameImpl = chain!(fullyQualifiedName!T);
+    }  
+    else static if (isStaticArray!T)
+    {
+        enum fullyQualifiedTypeNameImpl = chain!(
+            fullyQualifiedTypeNameImpl!(typeof(T.init[0]), qualifiers) ~ "["~to!string(T.length)~"]"
+        );
+    }
+    else static if (isArray!T)
+    {   
+        enum fullyQualifiedTypeNameImpl = chain!(
+            fullyQualifiedTypeNameImpl!(typeof(T.init[0]), qualifiers) ~ "[]"
+        );
+    }   
+    else static if (isAssociativeArray!T)
+    {   
+        enum fullyQualifiedTypeNameImpl = chain!(
+            fullyQualifiedTypeNameImpl!(ValueType!T, qualifiers) 
+            ~ "["
+            ~ fullyQualifiedTypeNameImpl!(KeyType!T, qualifiers)
+            ~ "]"
+        );
+    }   
+    else static if (isSomeFunction!T)
+    {   
+        enum fullyQualifiedTypeNameImpl = chain!(
+            fullyQualifiedTypeNameImpl!(ReturnType!T, no_qualifiers)
+            ~ "("
+            ~ parametersTypeString!(T)
+            ~ ")"
+        );
+    }
+    else static if (isPointer!T)
+    {
+    	enum fullyQualifiedTypeNameImpl = chain!(
+            fullyQualifiedTypeNameImpl!(PointerTarget!T, qualifiers)
+            ~ "*"
+    	);
+    }
+    else
+        // In case something is forgotten
+        static assert(0, "Unrecognized type " ~ T.stringof ~ ", can't convert to fully qualified string");
+}
+
+/// private
+// https://github.com/D-Programming-Language/phobos/pull/863
+private template fullyQualifiedTypeName(T)
+{
+    static assert(is(T), "Template parameter must be a type");
+    enum fullyQualifiedTypeName = fullyQualifiedTypeNameImpl!(T, false, false, false);
+}
+	
+version(unittest)
+{
+    struct QualifiedNameTests
+    {
+        struct Inner
+        {
+        }
+
+        ref const(Inner[string]) func( ref Inner var1, lazy scope string var2 );        
+
+        shared(const(Inner[string])[]) data;
+        
+        Inner delegate(double, string) deleg;
+
+        Inner[] array;
+        Inner[16] sarray;
+        Inner[Inner] aarray;
+
+        Json external_type;
+        Json[] ext_array;
+        Json[16] ext_sarray;
+        Json[Json] ext_aarray;
+    }
+}
+
+unittest
+{
+    static assert(fullyQualifiedTypeName!(string) == "immutable(char)[]");
+    static assert(fullyQualifiedTypeName!(Json)
+		== "vibe.data.json.Json");
+    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.ext_array))
+        == "vibe.data.json.Json[]");
+    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.ext_sarray))
+    	== "vibe.data.json.Json[16]");
+    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.ext_aarray))
+    	== "vibe.data.json.Json[vibe.data.json.Json]");
+
+    // these currently fail because fullyQualifiedName!T returns nonsense for inner types
+    version(none){
+	    static assert(fullyQualifiedTypeName!(QualifiedNameTests.Inner)
+			== "vibe.http.rest.QualifiedNameTests.Inner");
+	    static assert(fullyQualifiedTypeName!(ReturnType!(QualifiedNameTests.func))
+			== "const(vibe.http.rest.QualifiedNameTests.Inner[immutable(char)[]])");
+	    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.func))
+			== "const(vibe.http.rest.QualifiedNameTests.Inner[immutable(char)[]])(vibe.http.rest.QualifiedNameTests.Inner, immutable(char)[])");
+	    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.data))
+			== "shared(const(vibe.http.rest.QualifiedNameTests.Inner[immutable(char)[]])[])");
+	    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.deleg))
+			== "vibe.http.rest.QualifiedNameTests.Inner(double, immutable(char)[])");
+	    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.array))
+	    	== "vibe.http.rest.QualifiedNameTests.Inner[]");
+	    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.sarray))
+	    	== "vibe.http.rest.QualifiedNameTests.Inner[16]");
+	    static assert(fullyQualifiedTypeName!(typeof(QualifiedNameTests.aarray))
+	    	== "vibe.http.rest.QualifiedNameTests.Inner[vibe.http.rest.QualifiedNameTests.Inner]");
+	}
 }
 
 /// private
@@ -591,62 +791,49 @@ private void getRestMethodName(T)(string method, out HttpMethod http_verb, out s
 }
 
 /// private
-private string[] parameterNames(T)()
+private string[] parameterNames(alias FUNC)()
 {
-	auto str = extractParameters(T.stringof);
-	//pragma(msg, T.stringof);
+	static if( __traits(compiles, [ParameterIdentifierTuple!FUNC]) ){
+		import std.traits;
+		return[ParameterIdentifierTuple!FUNC];
+	} else {
+		pragma(msg, "Warning, using fallback method to get parameter names for the REST interface generator.");
+		pragma(msg, "Please consider upgrading to DMD 2.060 or later.");
+		auto str = extractParameters(typeof(&FUNC).stringof);
+		//pragma(msg, T.stringof);
 
-	string[] ret;
-	for( size_t i = 0; i < str.length; ){
-		skipWhitespace(str, i);
-		skipType(str, i);
-		skipWhitespace(str, i);
-		ret ~= skipIdent(str, i);
-		skipWhitespace(str, i);
-		if( i >= str.length ) break;
-		if( str[i] == '=' ){
-			i++;
+		string[] ret;
+		for( size_t i = 0; i < str.length; ){
 			skipWhitespace(str, i);
-			skipBalancedUntil(",", str, i);
-			if( i >= str.length ) break;
-		}
-		assert(str[i] == ',');
-		i++;
-	}
-
-	return ret;
-}
-
-/// private
-private string[] parameterDefaultValues(T)()
-{
-	auto str = extractParameters(T.stringof);
-	//pragma(msg, T.stringof);
-
-	string[] ret;
-	for( size_t i = 0; i < str.length; ){
-		skipWhitespace(str, i);
-		skipType(str, i);
-		skipWhitespace(str, i);
-		skipIdent(str, i);
-		skipWhitespace(str, i);
-		if( i >= str.length ) break;
-		if( str[i] == '=' ){
-			i++;
+			skipType(str, i);
 			skipWhitespace(str, i);
-			ret ~= skipBalancedUntil(",", str, i);
+			ret ~= skipIdent(str, i);
+			skipWhitespace(str, i);
 			if( i >= str.length ) break;
+			if( str[i] == '=' ){
+				i++;
+				skipWhitespace(str, i);
+				skipBalancedUntil(",", str, i);
+				if( i >= str.length ) break;
+			}
+			assert(str[i] == ',');
+			i++;
 		}
-		assert(str[i] == ',');
-		i++;
-	}
 
-	return ret;
+		return ret;
+	}
 }
 
 private string extractParameters(string str)
 {
-	size_t start = 0, end = str.length-1;
+	auto i1 = str.countUntil("function");
+	auto i2 = str.countUntil("delegate");
+	assert(i1 >= 0 || i2 >= 0);
+	size_t start;
+	if( i1 >= 0 && i2 >= 0) start = min(i1, i2);
+	else if( i1 >= 0 ) start = i1;
+	else start = i2;
+	size_t end = str.length-1;
 	while( str[start] != '(' ) start++;
 	while( str[end] != ')' ) end--;
 	return str[start+1 .. end];
@@ -674,6 +861,10 @@ private string skipIdent(string str, ref size_t i)
 
 private void skipType(string str, ref size_t i)
 {
+	if (str[i..$].startsWith("ref")) {
+		i += 3;
+		skipWhitespace(str, i);
+	}
 	skipIdent(str, i);
 	if( i < str.length && (str[i] == '(' || str[i] == '[') ){
 		int depth = 1;
@@ -682,6 +873,8 @@ private void skipType(string str, ref size_t i)
 			else if( str[i] == ')' || str[i] == ']' ) depth--;
 		}
 	}
+
+	while( i < str.length && str[i] == '*' ) i++;
 }
 
 private string skipBalancedUntil(string chars, string str, ref size_t i)
@@ -708,4 +901,27 @@ private template isPropertySetter(T)
 {
 	enum isPropertySetter = (functionAttributes!(T) & FunctionAttribute.property) != 0
 		&& is(ReturnType!T == void);
+}
+
+/// private
+private string toRestString(Json value)
+{
+	switch( value.type ){
+		default: return value.toString();
+		case Json.Type.Bool: return value.get!bool ? "true" : "false";
+		case Json.Type.Int: return to!string(value.get!long);
+		case Json.Type.Float: return to!string(value.get!double);
+		case Json.Type.String: return value.get!string;
+	}
+}
+
+/// private
+private T fromRestString(T)(string value)
+{
+	static if( is(T == bool) ) return value == "true";
+	else static if( is(T : int) ) return to!T(value);
+	else static if( is(T : double) ) return to!T(value); // FIXME: formattedWrite(dst, "%.16g", json.get!double);
+	else static if( is(T : string) ) return value;
+	else static if( __traits(compiles, T.fromString("hello")) ) return T.fromString(value);
+	else return deserializeJson!T(parseJson(value));
 }

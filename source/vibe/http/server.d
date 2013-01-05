@@ -7,7 +7,7 @@
 */
 module vibe.http.server;
 
-public import vibe.core.tcp;
+public import vibe.core.net;
 public import vibe.http.common;
 public import vibe.http.session;
 
@@ -17,18 +17,20 @@ import vibe.data.json;
 import vibe.http.dist;
 import vibe.http.form;
 import vibe.http.log;
-import vibe.inet.rfc5322;
+import vibe.inet.message;
 import vibe.inet.url;
 import vibe.stream.counting;
+import vibe.stream.operations;
 import vibe.stream.ssl;
 import vibe.stream.zlib;
-import vibe.templ.diet;
 import vibe.textfilter.urlencode;
+import vibe.utils.array;
 import vibe.utils.memory;
 import vibe.utils.string;
 import vibe.core.file;
 
-import std.algorithm : countUntil, min;
+import core.vararg;
+import std.algorithm : countUntil, map, min;
 import std.array;
 import std.conv;
 import std.datetime;
@@ -48,23 +50,24 @@ public import std.variant;
 /**
 	Starts a HTTP server listening on the specified port.
 
-	'request_task' will be called for each HTTP request that is made. The
-	'res' parameter of the callback then has to be filled with the response
+	request_handler will be called for each HTTP request that is made. The
+	res parameter of the callback then has to be filled with the response
 	data.
 	
-	The 'ip4_addr' or 'ip6_addr' parameters can be used to specify the network
-	interface on which the server socket is supposed to listen for connections.
-	By default, all IPv4 and IPv6 interfaces will be used.
-	
-	request_task can be either HttpServerRequestDelegate/HttpServerRequestFunction
+	request_handler can be either HttpServerRequestDelegate/HttpServerRequestFunction
 	or a class/struct with a member function 'handleRequest' that has the same
-	signature as HttpServerRequestDelegate/Function.
+	signature.
 
 	Note that if the application has been started with the --disthost command line
 	switch, listenHttp() will automatically listen on the specified VibeDist host
-	instead of locally. This allows for a seemless switch from single-host to 
+	instead of locally. This allows for a seamless switch from single-host to 
 	multi-host scenarios without changing the code. If you need to listen locally,
 	use listenHttpPlain() instead.
+
+	Params:
+		settings = Customizes the HTTP servers functionality.
+		request_handler = This callback is invoked for each incoming request and is responsible
+			for generating the response.
 */
 void listenHttp(HttpServerSettings settings, HttpServerRequestDelegate request_handler)
 {
@@ -113,7 +116,10 @@ void listenHttpPlain(HttpServerSettings settings, HttpServerRequestDelegate requ
 {
 	static void doListen(HttpServerSettings settings, HTTPServerListener listener, string addr)
 	{
-		listenTcp(settings.port, (TcpConnection conn){ handleHttpConnection(conn, listener); }, addr);
+		try {
+			listenTcp(settings.port, (TcpConnection conn){ handleHttpConnection(conn, listener); }, addr);
+			logInfo("Listening for HTTP%s requests on %s:%s", settings.sslKeyFile.length || settings.sslCertFile.length ? "S" : "", addr, settings.port);
+		} catch( Exception e ) logWarn("Failed to listen on %s:%s", addr, settings.port);
 	}
 
 	// Check for every bind address/port, if a new listening socket needs to be created and
@@ -151,6 +157,7 @@ void listenHttpPlain(HttpServerSettings settings, HttpServerRequestDelegate requ
 */
 @property HttpServerRequestDelegate staticTemplate(string template_file)()
 {
+	import vibe.templ.diet;
 	return (HttpServerRequest req, HttpServerResponse res){
 		//res.render!(template_file, req);
 		//res.headers["Content-Type"] = "text/html; charset=UTF-8";
@@ -210,8 +217,17 @@ void startListening()
 */
 @property void render(string template_file, ALIASES...)(HttpServerResponse res)
 {
+	import vibe.templ.diet;
 	res.headers["Content-Type"] = "text/html; charset=UTF-8";
 	parseDietFile!(template_file, ALIASES)(res.bodyWriter);
+}
+
+/**
+	Utility function that throws a HttpStatusException if the _condition is not met.
+*/
+void enforceHttp(T)(T condition, HttpStatus statusCode, string message = null)
+{
+	enforce(condition, new HttpStatusException(statusCode, message));
 }
 
 
@@ -320,8 +336,6 @@ class HttpServerSettings {
 	/// the url and all headers. 
 	ulong maxRequestHeaderSize = 8192;
 
-	uint maxRequestHeaderCount = 100;
-
 	/// Sets a custom handler for displaying error pages for HTTP errors
 	HttpServerErrorPageHandler errorPageHandler = null;
 
@@ -337,14 +351,23 @@ class HttpServerSettings {
 	///
 	string serverString = "vibe.d/" ~ VibeVersionString;
 
-	/*
-		Log format using Apache custom log format directives. E.g. NCSA combined:
+	/** Specifies the format used for the access log.
+
+		The log format is given using the Apache server syntax. By default NCSA combined is used.
+
+		---
 		"%h - %u %t \"%r\" %s %b \"%{Referer}i\" \"%{User-Agent}i\""
+		---
 	*/
 	string accessLogFormat = "%h - %u %t \"%r\" %s %b \"%{Referer}i\" \"%{User-Agent}i\"";
+
+	/// Spefifies the name of a file to which access log messages are appended.
 	string accessLogFile = "";
+
+	/// If set, access log entries will be output to the console.
 	bool accessLogToConsole = false;
 
+	/// Returns a duplicate of the settings object.
 	@property HttpServerSettings dup()
 	{
 		auto ret = new HttpServerSettings;
@@ -372,6 +395,7 @@ class HttpStatusException : Exception {
 		m_status = status;
 	}
 	
+	/// The HTTP status code
 	@property int status() const { return m_status; }
 }
 
@@ -380,36 +404,96 @@ class HttpStatusException : Exception {
 */
 final class HttpServerRequest : HttpRequest {
 	public {
+		/// The IP address of the client
 		string peer;
 
-		// enabled if HttpServerOption.ParseURL is set
+		/** The _path part of the URL.
+
+			Remarks: This field is only set if HttpServerOption.ParseURL is set.
+		*/
 		string path;
+
+		/** The user name part of the URL, if present.
+
+			Remarks: This field is only set if HttpServerOption.ParseURL is set.
+		*/
 		string username;
+
+		/** The _password part of the URL, if present.
+
+			Remarks: This field is only set if HttpServerOption.ParseURL is set.
+		*/
 		string password;
+
+		/** The _query string part of the URL.
+
+			Remarks: This field is only set if HttpServerOption.ParseURL is set.
+		*/
 		string queryString;
 
-		// enabled if HttpServerOption.ParseCookies is set
+		/** Contains the list of _cookies that are stored on the client.
+
+			Remarks: This field is only set if HttpServerOption.ParseCookies is set.
+		*/
 		string[string] cookies;
 		
-		// enabled if HttpServerOption.ParseQueryString is set
+		/** Contains all _form fields supplied using the _query string.
+
+			Remarks: This field is only set if HttpServerOption.ParseQueryString is set.
+		*/
 		string[string] query;
-		// filled by certain middleware (vibe.http.router)
+
+		/** A map of general parameters for the request.
+
+			This map is supposed to be used by middleware functionality to store
+			information for later stages. For example vibe.http.router.UrlRouter uses this map
+			to store the value of any named placeholders.
+		*/
 		string[string] params;
 
-		// body
-		InputStream bodyReader;
-		ubyte[] data;
-		Json json; // only set if HttpServerOption.ParseJsonBoxy is set
-		string[string] form; // only set if HttpServerOption.ParseFormBody is set
-		FilePart[string] files; // only set if HttpServerOption.ParseFormBody is set
+		/** Supplies the request body as a stream.
 
-		/*
-			body types:
-				x-form-data
-				json
-				multi-part/files
+			If the body has not already been read because one of the body parsers has
+			processed it (e.g. HttpServerOption.ParseFormBody), it can be read from
+			this stream.
 		*/
+		InputStream bodyReader;
 
+		/** Contains the parsed Json for a JSON request.
+
+			Remarks:
+				This field is only set if HttpServerOption.ParseJsonBody is set.
+
+				A JSON request must have the Content-Type "application/json".
+		*/
+		Json json;
+
+		/** Contains the parsed parameters of a HTML POST _form request.
+
+			Remarks:
+				This field is only set if HttpServerOption.ParseFormBody is set.
+
+				A form request must either have the Content-Type
+				"application/x-www-form-urlencoded" or "multipart/form-data".
+		*/
+		string[string] form;
+
+		/** Contains information about any uploaded file for a HTML _form request.
+
+			Remarks:
+				This field is only set if HttpServerOption.ParseFormBody is set amd
+				if the Content-Type is "multipart/form-data".
+		*/
+		FilePart[string] files;
+
+		/** The current Session object.
+
+			This field is set if HttpServerResponse.startSession() has been called
+			on a previous response and if the client has sent back the matching
+			cookie.
+
+			Remarks: Requires the HttpServerOption.ParseCookies option.
+		*/
 		Session session;
 	}
 	private {
@@ -421,15 +505,21 @@ final class HttpServerRequest : HttpRequest {
 		m_timeCreated = Clock.currTime().toUTC();
 	}
 
-	@property SysTime timeCreated() {
-		return m_timeCreated;
-	}
+	@property inout(SysTime) timeCreated() inout { return m_timeCreated; }
 
 	MultiPart nextPart()
 	{
 		assert(false);
 	}
 
+	/** The relative path the the root folder.
+
+		Using this function instead of absolute URLs for embedded links can be
+		useful to avoid dead link when the site is piped through a
+		reverse-proxy.
+
+		The returned string always ends with a slash.
+	*/
 	@property string rootDir() const {
 		if( path.length == 0 ) return "./";
 		auto depth = count(path[1 .. $], '/');
@@ -465,18 +555,24 @@ final class HttpServerResponse : HttpResponse {
 		m_requestAlloc = req_alloc;
 	}
 	
+	@property SysTime timeFinalized() { return m_timeFinalized; }
+
+	/** Determines if the HTTP header has already been written.
+	*/
 	@property bool headerWritten() const { return m_headerWritten; }
 
+	/** Determines if the response does not need a body.
+	*/
 	bool isHeadResponse() const { return m_isHeadResponse; }
 
-	/// Writes the hole body of the response at once.
+	/// Writes the hole response body at once.
 	void writeBody(in ubyte[] data, string content_type = null)
 	{
 		if( content_type ) headers["Content-Type"] = content_type;
 		headers["Content-Length"] = formatAlloc(m_requestAlloc, "%d", data.length);
 		bodyWriter.write(data);
 	}
-
+	/// ditto
 	void writeBody(string data, string content_type = "text/plain")
 	{
 		writeBody(cast(ubyte[])data, content_type);
@@ -485,6 +581,11 @@ final class HttpServerResponse : HttpResponse {
 	/// Writes a JSON message with the specified status
 	void writeJsonBody(T)(T data, int status = HttpStatus.OK)
 	{
+		import std.traits;
+		static if( is(typeof(data.data())) && isArray!(typeof(data.data())) ){
+			static assert(!is(T == Appender!(typeof(data.data()))), "Passed an Appender!T to writeJsonBody - this is most probably not doing what's indended.");
+		}
+
 		statusCode = status;
 		writeBody(cast(ubyte[])serializeToJson(data).toString(), "application/json");
 	}
@@ -564,6 +665,8 @@ final class HttpServerResponse : HttpResponse {
 		bodyWriter.write("redirecting...");
 	}
 
+	/** Special method sending a SWITCHING_PROTOCOLS response to the client.
+	*/
 	Stream switchProtocol(string protocol) {
 		statusCode = HttpStatus.SwitchingProtocols;
 		headers["Upgrade"] = protocol;
@@ -615,6 +718,11 @@ final class HttpServerResponse : HttpResponse {
 		This version of render() works around a compiler bug in DMD (Issue 2962). You should use
 		this method instead of render() as long as this bug is not fixed.
 
+		The first template argument is the name of the template file. All following arguments
+		must be pairs of a type and a string, each specifying one parameter. Parameter values
+		can be passed either as a value of the same type as specified by the template
+		arguments, or as a Variant which has the same type stored.
+
 		Note that the variables are copied and not referenced inside of the template - any
 		modification you do on them from within the template will get lost.
 
@@ -625,16 +733,17 @@ final class HttpServerResponse : HttpResponse {
 			res.renderCompat!("mytemplate.jd",
 				string, "title",
 				int, "pageNumber")
-				(Variant(title), Variant(pageNumber));
+				(title, pageNumber);
 			---
 	*/
-	void renderCompat(string template_file, TYPES_AND_NAMES...)(Variant[] args...)
+	void renderCompat(string template_file, TYPES_AND_NAMES...)(...)
 	{
+		import vibe.templ.diet;
 		headers["Content-Type"] = "text/html; charset=UTF-8";
-		.parseDietFileCompat!(template_file, TYPES_AND_NAMES)(bodyWriter, args);
+		compileDietFileCompatV!(template_file, TYPES_AND_NAMES)(bodyWriter, _argptr, _arguments);
 	}
 
-	/// Finalizes the response. This is called automatically by the server.
+	// Finalizes the response. This is called automatically by the server.
 	private void finalize() 
 	{
 		if( m_bodyWriter ) m_bodyWriter.finalize();
@@ -642,7 +751,6 @@ final class HttpServerResponse : HttpResponse {
 		m_conn.flush();
 		m_timeFinalized = Clock.currTime().toUTC();
 	}
-	@property SysTime timeFinalized() { return m_timeFinalized; }
 
 	private void writeHeader()
 	{
@@ -738,7 +846,6 @@ private struct HTTPServerListener {
 }
 
 private enum MaxHttpHeaderLineLength = 4096;
-private enum MaxHttpRequestHeaderSize = 8192;
 
 private class LimitedHttpInputStream : LimitedInputStream {
 	this(InputStream stream, ulong byte_limit, bool silent_limit = false) {
@@ -833,8 +940,8 @@ private void handleHttpConnection(TcpConnection conn_, HTTPServerListener listen
 
 private bool handleRequest(Stream conn, string peer_address, HTTPServerListener listen_info, ref HttpServerSettings settings)
 {
-	auto base_allocator = scoped!AutoFreeListAllocator();
-	auto request_allocator = scoped!PoolAllocator(1024, base_allocator.Scoped_payload);
+	auto request_allocator = scoped!PoolAllocator(1024, defaultAllocator());
+	scope(exit) request_allocator.reset();
 
 	// some instances that live only while the request is running
 	FreeListRef!NullOutputStream nullWriter = FreeListRef!NullOutputStream();
@@ -891,6 +998,7 @@ private bool handleRequest(Stream conn, string peer_address, HTTPServerListener 
 	try {
 		logTrace("reading request..");
 
+		// limit the total request size
 		InputStream reqReader;
 		if( settings.maxRequestTime == dur!"seconds"(0) ) reqReader = conn;
 		else {
@@ -899,17 +1007,9 @@ private bool handleRequest(Stream conn, string peer_address, HTTPServerListener 
 		}
 
 		// basic request parsing
-		req = parseRequest(reqReader, request_allocator);
 		req.peer = peer_address;
+		parseRequestHeader(req, reqReader, request_allocator, settings.maxRequestHeaderSize);
 		logTrace("Got request header.");
-
-		//handle Expect-Header
-		if( auto pv = "Expect" in req.headers) {
-			if( *pv == "100-continue" ) {
-				logTrace("sending 100 continue");
-				conn.write("HTTP/1.1 100 Continue\r\n");
-			}
-		}
 
 		// find the matching virtual host
 		foreach( ctx; g_contexts )
@@ -949,12 +1049,20 @@ private bool handleRequest(Stream conn, string peer_address, HTTPServerListener 
 			limited_http_input_stream = FreeListRef!LimitedHttpInputStream(chunked_input_stream, settings.maxRequestSize, true);
 		} else {
 			auto pc = "Connection" in req.headers;
-			if( pc && *pc == "close" )
+			if( pc && *pc == "close" && req.httpVersion == HttpVersion.HTTP_1_0 )
 				limited_http_input_stream = FreeListRef!LimitedHttpInputStream(reqReader, settings.maxRequestSize, true);
 			else
 				limited_http_input_stream = FreeListRef!LimitedHttpInputStream(reqReader, 0);
 		}
 		req.bodyReader = limited_http_input_stream;
+
+		// handle Expect header
+		if( auto pv = "Expect" in req.headers) {
+			if( *pv == "100-continue" ) {
+				logTrace("sending 100 continue");
+				conn.write("HTTP/1.1 100 Continue\r\n\r\n");
+			}
+		}
 
 		// Url parsing if desired
 		if( settings.options & HttpServerOption.ParseURL ){
@@ -989,12 +1097,12 @@ private bool handleRequest(Stream conn, string peer_address, HTTPServerListener 
 
 		if( settings.options & HttpServerOption.ParseFormBody ){
 			auto ptype = "Content-Type" in req.headers;				
-			if( ptype ) parseFormData(req.form, req.files, *ptype, req.bodyReader);
+			if( ptype ) parseFormData(req.form, req.files, *ptype, req.bodyReader, MaxHttpHeaderLineLength);
 		}
 
 		if( settings.options & HttpServerOption.ParseJsonBody ){
 			auto ptype = "Content-Type" in req.headers;				
-			if( ptype && *ptype == "application/json" ){
+			if( ptype && split(*ptype, ";").map!(a => a.strip())().startsWith("application/json") ){
 				auto bodyStr = cast(string)req.bodyReader.readAll();
 				req.json = parseJson(bodyStr);
 			}
@@ -1023,20 +1131,20 @@ private bool handleRequest(Stream conn, string peer_address, HTTPServerListener 
 		logDebug("http error thrown: %s", err.toString());
 		if ( !res.headerWritten ) errorOut(err.status, err.msg, err.toString(), err);
 		else logError("HttpStatusException after page has been written: %s", err.toString());
-		logDebug("Exception while handling request: %s", err.toString());
+		logDebug("Exception while handling request %s %s: %s", req.method, req.url, err.toString());
 		if ( !parsed || justifiesConnectionClose(err.status) )
 			keep_alive = false;
 	} catch (Throwable e) {
-		logDebug("Exception while parsing request: %s", e.toString());
 		auto status = parsed ? HttpStatus.InternalServerError : HttpStatus.BadRequest;
 		if( !res.headerWritten ) errorOut(status, httpStatusText(status), e.toString(), e);
-		else logError("Error after page has been written: %s", e.msg);
-		logDebug("Exception while handling request: %s", e.toString());
+		else logError("Error after page has been written: %s", e.toString());
+		logDebug("Exception while handling request %s %s: %s", req.method, req.url, e.toString());
 		if ( !parsed )
 			keep_alive = false;
 	}
 
-	nullWriter.write(req.bodyReader);
+	if( req.bodyReader && !req.bodyReader.empty )
+		nullWriter.write(req.bodyReader);
 
 	// finalize (e.g. for chunked encoding)
 	res.finalize();
@@ -1056,10 +1164,9 @@ private bool handleRequest(Stream conn, string peer_address, HTTPServerListener 
 }
 
 
-private FreeListRef!HttpServerRequest parseRequest(InputStream conn, Allocator alloc)
+private void parseRequestHeader(HttpServerRequest req, InputStream conn, Allocator alloc, ulong max_header_size)
 {
-	auto req = FreeListRef!HttpServerRequest();
-	auto stream = FreeListRef!LimitedHttpInputStream(conn, MaxHttpRequestHeaderSize);
+	auto stream = FreeListRef!LimitedHttpInputStream(conn, max_header_size);
 
 	logTrace("HTTP server reading status line");
 	auto reqln = cast(string)stream.readLine(MaxHttpHeaderLineLength, "\r\n", alloc);
@@ -1082,8 +1189,6 @@ private FreeListRef!HttpServerRequest parseRequest(InputStream conn, Allocator a
 	
 	//headers
 	parseRfc5322Header(stream, req.headers, MaxHttpHeaderLineLength, alloc);
-
-	return req;
 }
 
 private void parseCookies(string str, ref string[string] cookies) 

@@ -93,17 +93,22 @@ class LibevDriver : EventDriver {
 		ev_break(m_loop, EVBREAK_ALL);
 	}
 	
-	FileStream openFile(string path, FileMode mode)
+	FileStream openFile(Path path, FileMode mode)
 	{
 		return new ThreadedFileStream(path, mode);
 	}
 	
+	DirectoryWatcher watchDirectory(Path path, bool recursive)
+	{
+		assert(false);
+	}
+
 	TcpConnection connectTcp(string host, ushort port)
 	{
 		assert(false);
 	}
 	
-	void listenTcp(ushort port, void delegate(TcpConnection conn) conn_callback, string address)
+	TcpListener listenTcp(ushort port, void delegate(TcpConnection conn) conn_callback, string address)
 	{
 		sockaddr_in addr_ip4;
 		addr_ip4.sin_family = AF_INET;
@@ -147,26 +152,26 @@ class LibevDriver : EventDriver {
 		return null;
 	}
 
-	private int listenTcpGeneric(SOCKADDR)(int af, SOCKADDR* sock_addr, ushort port, void delegate(TcpConnection conn) connection_callback)
+	private LibeventTcpListener listenTcpGeneric(SOCKADDR)(int af, SOCKADDR* sock_addr, ushort port, void delegate(TcpConnection conn) connection_callback)
 	{
 		auto listenfd = socket(af, SOCK_STREAM, 0);
 		if( listenfd == -1 ){
 			logError("Error creating listening socket> %s", af);
-			return -1;
+			return null;
 		}
 		int tmp_reuse = 1; 
 		if( setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &tmp_reuse, tmp_reuse.sizeof) ){
 			logError("Error enabling socket address reuse on listening socket");
-			return -1;
+			return null;
 		}
 		if( bind(listenfd, cast(
 sockaddr*)sock_addr, SOCKADDR.sizeof) ){
 			logError("Error binding listening socket");
-			return -1;
+			return null;
 		}
 		if( listen(listenfd, 128) ){
 			logError("Error listening to listening socket");
-			return -1;
+			return null;
 		}
 
 		// Set socket for non-blocking I/O
@@ -179,7 +184,7 @@ sockaddr*)sock_addr, SOCKADDR.sizeof) ){
 		w_accept.data = cast(void*)this;
 		addEventReceiver(m_core, listenfd, new TcpListener(connection_callback));
 
-		return 0;
+		return new LibevTcpListener(listenfd, w_accept);
 	}
 }
 

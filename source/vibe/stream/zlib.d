@@ -7,7 +7,8 @@
 */
 module vibe.stream.zlib;
 
-import vibe.stream.stream;
+import vibe.core.stream;
+import vibe.utils.memory;
 
 import std.algorithm;
 import std.exception;
@@ -41,13 +42,13 @@ class GzipOutputStream : ZlibOutputStream {
 class ZlibOutputStream : OutputStream {
 	private {
 		OutputStream m_out;
-		Compress m_comp;
+		FreeListRef!Compress m_comp;
 	}
 
 	this(OutputStream dst, HeaderFormat type)
 	{
 		m_out = dst;
-		m_comp = new Compress(type);
+		m_comp = FreeListRef!Compress(type);
 	}
 
 	void write(in ubyte[] data, bool do_flush = true)
@@ -108,7 +109,7 @@ class GzipInputStream : ZlibInputStream {
 class ZlibInputStream : InputStream {
 	private {
 		InputStream m_in;
-		UnCompress m_uncomp;
+		FreeListRef!UnCompress m_uncomp;
 		ubyte[] m_buffer;
 		bool m_finished = false;
 	}
@@ -116,7 +117,7 @@ class ZlibInputStream : InputStream {
 	this(InputStream src, HeaderFormat type)
 	{
 		m_in = src;
-		m_uncomp = new UnCompress(type);
+		m_uncomp = FreeListRef!UnCompress(type);
 	}
 
 	@property bool empty()
@@ -128,8 +129,12 @@ class ZlibInputStream : InputStream {
 	@property ulong leastSize()
 	{
 		if( m_buffer.length ) return m_buffer.length;
-		if( m_in.empty ) return 0;
+		if( m_finished ){
+			assert(m_in.empty);
+			return 0;
+		}
 		readChunk();
+		assert(m_buffer.length || empty);
 		return m_buffer.length;
 	}
 
@@ -152,8 +157,10 @@ class ZlibInputStream : InputStream {
 			dst[0 .. sz] = m_buffer[0 .. sz];
 			dst = dst[sz .. $];
 			m_buffer = m_buffer[sz .. $];
-			if( !m_buffer.length && !m_finished )
-				readChunk();
+			if( !m_buffer.length ){
+				assert(!dst.length || !m_finished, "Bug: UnCompress returned an empty buffer but more is still to be read.");
+				if( !m_finished ) readChunk();
+			}
 		}
 	}
 

@@ -13,7 +13,10 @@ import std.algorithm;
 import std.exception;
 import std.conv;
 import std.utf;
-//import std.net.isemail; // does not link
+import std.compiler;
+
+static if( D_major > 2 || D_major == 2 && D_minor >= 60 )
+	import std.net.isemail; // does not link pre 2.060
 
 
 /** Provides a simple email address validation.
@@ -29,15 +32,15 @@ string validateEmail(string str, size_t max_length = 64)
 	enforce(str.length <= 64, "The email address may not be longer than "~to!string(max_length)~"characters.");
 	auto at_idx = str.countUntil('@');
 	enforce(at_idx > 0, "Email is missing the '@'.");
-	validateIdent(str[0 .. at_idx], "!#$%&'*+-/=?^_`{|}~.(),:;<>@[\\]", "An email user name");
+	validateIdent(str[0 .. at_idx], "!#$%&'*+-/=?^_`{|}~.(),:;<>@[\\]", "An email user name", false);
 	
 	auto domain = str[at_idx+1 .. $];
 	auto dot_idx = domain.countUntil('.');
 	enforce(dot_idx > 0 && dot_idx < str.length-2, "The email domain is not valid.");
 	enforce(!domain.anyOf(" @,[](){}<>!\"'%&/\\?*#;:|"), "The email domain contains invalid characters.");
 	
-	// does not link!?
-	//enforce(isEmail(str) == EmailStatusCode.valid, "The email address is invalid.");
+	static if(D_major > 2 || D_major == 2 && D_minor >= 60)
+		enforce(isEmail(str) == EmailStatusCode.valid, "The email address is invalid.");
 	
 	return str;
 }
@@ -49,13 +52,13 @@ string validateEmail(string str, size_t max_length = 64)
 	
 	Invalid user names will cause an exception with the error description to be thrown.
 */
-string validateUserName(string str, int min_length = 3, int max_length = 32, string additional_chars = "-_")
+string validateUserName(string str, int min_length = 3, int max_length = 32, string additional_chars = "-_", bool no_number_start = true)
 {
 	enforce(str.length >= min_length,
 		"The user name must be at least "~to!string(min_length)~" characters long.");
 	enforce(str.length <= max_length,
 		"The user name must not be longer than "~to!string(max_length)~" characters.");
-	validateIdent(str, additional_chars, "A user name");
+	validateIdent(str, additional_chars, "A user name", no_number_start);
 	
 	return str;
 }
@@ -67,17 +70,17 @@ string validateUserName(string str, int min_length = 3, int max_length = 32, str
 	
 	Invalid identifiers will cause an exception with the error description to be thrown.
 */
-string validateIdent(string str, string additional_chars = "_", string entity_name = "An identifier")
+string validateIdent(string str, string additional_chars = "_", string entity_name = "An identifier", bool no_number_start = true)
 {
 	// NOTE: this is meant for ASCII identifiers only!
 	foreach( i, char ch; str ){
 		if( ch >= 'a' && ch <= 'z' ) continue;
 		if( ch >= 'A' && ch <= 'Z' ) continue;
 		if( i > 0 && ch >= '0' && ch <= '9' ) continue;
-		if( additional_chars.countUntil(ch) >= 0 ) continue;
-		if( ch >= '0' && ch <= '9' )
-			throw new Exception(entity_name~" must not begin with a number.");
-		throw new Exception(entity_name~" may only contain numbers, letters and one of ("~additional_chars~")");
+		if( additional_chars.countUntil(ch) >= 0 ) continue; 
+		if( no_number_start && ch >= '0' && ch <= '9' ) 
+	    	throw new Exception(entity_name~" must not begin with a number."); 
+		//throw new Exception(entity_name~" may only contain numbers, letters and one of ("~additional_chars~")");
 	}
 	
 	return str;
@@ -95,12 +98,14 @@ string validatePassword(string str, string str_confirm, size_t min_length = 8, s
 	return str;
 }
 
+/** Checks if a string falls within the specified length range.
+*/
 string validateString(string str, size_t min_length = 0, size_t max_length = 0, string entity_name = "String")
 {
 	std.utf.validate(str);
 	enforce(str.length >= min_length,
 		entity_name~" must be at least "~to!string(min_length)~" characters long.");
 	enforce(!max_length || str.length <= max_length,
-		entity_name~" must not be longer than "~to!string(min_length)~" characters.");
+		entity_name~" must not be longer than "~to!string(max_length)~" characters.");
 	return str;
 }

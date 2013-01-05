@@ -38,7 +38,7 @@ private struct Action {
 		Conflict,
 		Failure
 	}
-	
+
 	this( ActionId id, string pkg, const Dependency d, Dependency[string] issue) {
 		action = id; packageId = pkg; vers = new Dependency(d); issuer = issue;
 	}
@@ -46,7 +46,7 @@ private struct Action {
 	const string packageId;
 	const Dependency vers;
 	const Dependency[string] issuer;
-	
+
 	string toString() const {
 		return to!string(action) ~ ": " ~ packageId ~ ", " ~ to!string(vers);
 	}
@@ -60,15 +60,16 @@ private class Application {
 		Package m_main;
 		Package[string] m_packages;
 	}
-	
+
 	this(Path rootFolder) {
 		m_root = rootFolder;
+		m_json = Json.EmptyObject;
 		reinit();
 	}
-	
+
 	/// Gathers information
 	string info() const {
-		if(!m_main) 
+		if(!m_main)
 			return "-Unregocgnized application in '"~to!string(m_root)~"' (properly no package.json in this directory)";
 		string s = "-Application identifier: " ~ m_main.name;
 		s ~= "\n" ~ m_main.info();
@@ -77,7 +78,7 @@ private class Application {
 			s ~= "\n" ~ p.info();
 		return s;
 	}
-	
+
 	/// Gets all installed packages as a "packageId" = "version" associative array
 	string[string] installedPackages() const {
 		string[string] pkgs;
@@ -85,31 +86,25 @@ private class Application {
 			pkgs[k] = p.vers;
 		return pkgs;
 	}
-	
+
 	/// Writes the application's metadata to the package.json file
 	/// in it's root folder.
 	void writeMetadata() const {
 		assert(false);
 		// TODO
 	}
-	
+
 	/// Rereads the applications state.
 	void reinit() {
 		m_packages.clear();
 		m_main = null;
-		
-		try {
-			m_json = jsonFromFile(m_root ~ "vpm.json");
-		}
-		catch(Throwable t) {
-			Json[string] j;
-			m_json = j;
-		}
-		
+
+		try m_json = jsonFromFile(m_root ~ "vpm.json");
+		catch(Exception t) logDebug("Could not open vpm.json: %s", t.msg);
+
 		if(!exists(to!string(m_root~"package.json"))) {
 			logWarn("There was no 'package.json' found for the application in '%s'.", m_root);
-		}
-		else {
+		} else {
 			m_main = new Package(m_root);
 			if(exists(to!string(m_root~"modules"))) {
 				foreach( string pkg; dirEntries(to!string(m_root ~ "modules"), SpanMode.shallow) ) {
@@ -128,6 +123,10 @@ private class Application {
 		}
 	}
 
+	/// Returns the applications name.
+	@property string name() const { return m_main ? m_main.name : "app"; }
+
+	/// Returns the DFLAGS
 	@property string[] dflags() const {
 		auto ret = appender!(string[])();
 		if( m_main ) ret.put(m_main.dflags());
@@ -145,16 +144,16 @@ private class Application {
 		}
 		return ret.data();
 	}
-	
+
 	/// Actions which can be performed to update the application.
 	Action[] actions(PackageSupplier packageSupplier, int option) {
 		scope(exit) writeVpmJson();
-		
+
 		if(!m_main) {
 			Action[] a;
 			return a;
 		}
-		
+
 		auto graph = new DependencyGraph(m_main);
 		if(!gatherMissingDependencies(packageSupplier, graph)  || graph.missing().length > 0) {
 			logError("The dependency graph could not be filled.");
@@ -163,7 +162,7 @@ private class Application {
 				actions ~= Action(Action.ActionId.Failure, pkg, rdp.dependency, rdp.packages);
 			return actions;
 		}
-		
+
 		auto conflicts = graph.conflicted();
 		if(conflicts.length > 0) {
 			logDebug("Conflicts found");
@@ -172,7 +171,7 @@ private class Application {
 				actions ~= Action(Action.ActionId.Conflict, pkg, dbp.dependency, dbp.packages);
 			return actions;
 		}
-		
+
 		// Gather installed
 		Package[string] installed;
 		installed[m_main.name] = m_main;
@@ -180,18 +179,18 @@ private class Application {
 			enforce( pkg !in installed, "The package '"~pkg~"' is installed more than once." );
 			installed[pkg] = p;
 		}
-		
+
 		// To see, which could be uninstalled
 		Package[string] unused = installed.dup;
 		unused.remove( m_main.name );
-	
+
 		// Check against installed and add install actions
 		Action[] actions;
 		Action[] uninstalls;
 		foreach( string pkg, d; graph.needed() ) {
 			auto p = pkg in installed;
 			// TODO: auto update to latest head revision
-			if(!p || !d.dependency.matches(p.vers)) {
+			if(!p || (!d.dependency.matches(p.vers) && !d.dependency.matches(Version.MASTER))) {
 				if(!p) logDebug("Application not complete, required package '"~pkg~"', which was not found.");
 				else logDebug("Application not complete, required package '"~pkg~"', invalid version. Required '%s', available '%s'.", d.dependency, p.vers);
 				actions ~= Action(Action.ActionId.InstallUpdate, pkg, d.dependency, d.packages);
@@ -202,25 +201,25 @@ private class Application {
 					uninstalls ~= Action( Action.ActionId.Uninstall, pkg, new Dependency("==" ~ p.vers), em);
 					actions ~= Action(Action.ActionId.InstallUpdate, pkg, d.dependency, d.packages);
 				}
-				
+
 				if( (pkg in unused) !is null )
 					unused.remove(pkg);
 			}
 		}
-		
+
 		// Add uninstall actions
 		foreach( string pkg, p; unused ) {
 			logDebug("Superfluous package found: '"~pkg~"', version '"~p.vers~"'");
 			Dependency[string] em;
 			uninstalls ~= Action( Action.ActionId.Uninstall, pkg, new Dependency("==" ~ p.vers), em);
 		}
-		
+
 		// Ugly "uninstall" comes first
 		actions = uninstalls ~ actions;
-		
+
 		return actions;
 	}
-	
+
 	void createZip(string destination) {
 		assert(false); // not properly implemented
 		/*
@@ -229,7 +228,7 @@ private class Application {
 		if(exists(ignoreFile)){
 			auto iFile = openFile(ignoreFile);
 			scope(exit) iFile.close();
-			while(!iFile.empty) 
+			while(!iFile.empty)
 				ignores ~= to!string(cast(char[])iFile.readLine());
 			logDebug("Using '%s' found by the application.", ignoreFile);
 		}
@@ -242,7 +241,7 @@ private class Application {
 		ignores ~= "modules/*"; // modules will not be included
 		foreach(string i; ignores)
 			logDebug(" " ~ i);
-		
+
 		logDebug("Creating zip file from application: " ~ m_main.name);
 		auto archive = new ZipArchive();
 		foreach( string file; dirEntries(to!string(m_root), SpanMode.depth) ) {
@@ -250,7 +249,7 @@ private class Application {
 			auto p = Path(file);
 			p = p[m_root.length..p.length];
 			if(isDir(file)) continue;
-			foreach(string ignore; ignores) 
+			foreach(string ignore; ignores)
 				if(globMatch(file, ignore))
 					would work, as I see it;
 					continue;
@@ -262,14 +261,14 @@ private class Application {
 			am.expandedData = f.readAll();
 			archive.addMember(am);
 		}
-		
+
 		logDebug(" Writing zip: %s", destination);
 		auto dst = openFile(destination, FileMode.CreateTrunc);
 		scope(exit) dst.close();
 		dst.write(cast(ubyte[])archive.build());
 		*/
 	}
-	
+
 	private bool gatherMissingDependencies(PackageSupplier packageSupplier, DependencyGraph graph) {
 		RequestedDependency[string] missing = graph.missing();
 		RequestedDependency[string] oldMissing;
@@ -279,7 +278,7 @@ private class Application {
 				foreach(string pkg, reqDep; missing) {
 					auto o = pkg in oldMissing;
 					if(o && reqDep.dependency != o.dependency) {
-						different = true; 
+						different = true;
 						break;
 					}
 				}
@@ -288,7 +287,7 @@ private class Application {
 					return false;
 				}
 			}
-			
+
 			oldMissing = missing.dup;
 			logTrace("There are %s packages missing.", missing.length);
 			foreach(string pkg, reqDep; missing) {
@@ -296,11 +295,11 @@ private class Application {
 					logTrace("Dependency to "~pkg~" is invalid. Trying to fix by modifying others.");
 					continue;
 				}
-				
+
 				// TODO: auto update and update interval by time
 				logTrace("Adding package to graph: "~pkg);
 				Package p = null;
-				
+
 				// Try an already installed package first
 				if(!needsUpToDateCheck(pkg)) {
 					try {
@@ -325,17 +324,17 @@ private class Application {
 						logError("Geting package metadata for %s failed, exception: %s", pkg, e.toString());
 					}
 				}
-				
+
 				if(p)
 					graph.insert(p);
 			}
 			graph.clearUnused();
 			missing = graph.missing();
 		}
-		
+
 		return true;
 	}
-	
+
 	private bool needsUpToDateCheck(string packageId) {
 		try {
 			auto time = m_json["vpm"]["lastUpdate"][packageId].to!string;
@@ -345,24 +344,20 @@ private class Application {
 			return true;
 		}
 	}
-	
+
 	private void markUpToDate(string packageId) {
 		logTrace("markUpToDate(%s)", packageId);
-		Json create(Json json, string object) {
-			auto d = object in json;
-			if(d is null) {
-				Json[string] o;
-				json[object] = o;
-			}
+		Json create(ref Json json, string object) {
+			if( object !in json ) json[object] = Json.EmptyObject;
 			return json[object];
 		}
 		create(m_json, "vpm");
 		create(m_json["vpm"], "lastUpdate");
 		m_json["vpm"]["lastUpdate"][packageId] = Json( Clock.currTime().toISOExtString() );
-		
+
 		writeVpmJson();
 	}
-	
+
 	private void writeVpmJson() {
 		// don't bother to write an empty file
 		if( m_json.length == 0 ) return;
@@ -390,6 +385,7 @@ PackageSupplier defaultPackageSupplier() {
 
 enum UpdateOptions
 {
+	None = 0,
 	JustAnnotate = 1<<0,
 	Reinstall = 1<<1
 };
@@ -402,35 +398,36 @@ class Vpm {
 		Application m_app;
 		PackageSupplier m_packageSupplier;
 	}
-	
+
 	/// Initiales the package manager for the vibe application
-	/// under root. 
+	/// under root.
 	this(Path root, PackageSupplier ps = defaultPackageSupplier()) {
 		enforce(root.absolute, "Specify an absolute path for the VPM");
 		m_root = root;
 		m_packageSupplier = ps;
 		m_app = new Application(root);
 	}
-	
+
+	/// Returns the name listed in the package.json of the current
+	/// application.
+	@property string packageName() const { return m_app.name; }
+
 	/// Returns a list of flags which the application needs to be compiled
 	/// properly.
 	@property string[] dflags() { return m_app.dflags; }
-	
+
 	/// Lists all installed modules
 	void list() {
 		logInfo(m_app.info());
 	}
-	
+
 	/// Performs installation and uninstallation as necessary for
 	/// the application.
 	/// @param options bit combination of UpdateOptions
-	bool update(int options) {
+	bool update(UpdateOptions options) {
 		Action[] actions = m_app.actions(m_packageSupplier, options);
-		if( actions.length == 0 ) {
-			logInfo("You are up to date");
-			return true;
-		}
-		
+		if( actions.length == 0 ) return true;
+
 		logInfo("The following changes could be performed:");
 		bool conflictedOrFailed = false;
 		foreach(Action a; actions) {
@@ -442,12 +439,12 @@ class Vpm {
 					logInfo(" "~pkg~": %s", d);
 			}
 		}
-		
+
 		if( conflictedOrFailed || options & UpdateOptions.JustAnnotate )
 			return conflictedOrFailed;
-		
+
 		// Uninstall first
-		
+
 		// ??
 		// foreach(Action a	   ; filter!((Action a)        => a.action == Action.ActionId.Uninstall)(actions))
 			// uninstall(a.packageId);
@@ -459,7 +456,7 @@ class Vpm {
 		foreach(Action a; actions)
 			if(a.action == Action.ActionId.InstallUpdate)
 				install(a.packageId, a.vers);
-		
+
 		m_app.reinit();
 		Action[] newActions = m_app.actions(m_packageSupplier, 0);
 		if(newActions.length > 0) {
@@ -469,15 +466,15 @@ class Vpm {
 		}
 		else
 			logInfo("You are up to date");
-		
+
 		return newActions.length == 0;
 	}
-	
+
 	/// Creates a zip from the application.
 	void createZip(string zipFile) {
 		m_app.createZip(zipFile);
 	}
-	
+
 	/// Prints some information to the log.
 	void info() {
 		logInfo("Status for %s", m_root);
@@ -486,7 +483,7 @@ class Vpm {
 
 	/// Gets all installed packages as a "packageId" = "version" associative array
 	string[string] installedPackages() const { return m_app.installedPackages(); }
-	
+
 	/// Installs the package matching the dependency into the application.
 	/// @param addToApplication if true, this will also add an entry in the
 	/// list of dependencies in the application's package.json
@@ -495,7 +492,7 @@ class Vpm {
 		auto destination = m_root ~ "modules" ~ packageId;
 		if(exists(to!string(destination)))
 			throw new Exception(packageId~" needs to be uninstalled prior installation.");
-		
+
 		// download
 		ZipArchive archive;
 		{
@@ -508,67 +505,67 @@ class Vpm {
 			if(exists(sTempFile)) remove(sTempFile);
 			m_packageSupplier.storePackage(tempFile, packageId, dep); // Q: continue on fail?
 			scope(exit) remove(sTempFile);
-			
-			// unpack 
+
+			// unpack
 			auto f = openFile(to!string(tempFile), FileMode.Read);
 			scope(exit) f.close();
 			ubyte[] b = new ubyte[cast(uint)f.leastSize];
 			f.read(b);
 			archive = new ZipArchive(b);
 		}
-		
+
 		Path getPrefix(ZipArchive a) {
 			foreach(ArchiveMember am; a.directory)
 				if( Path(am.name).head == PathEntry("package.json") )
 					return Path(am.name).parentPath;
-			
+
 			// not correct zip packages HACK
 			Path minPath;
 			foreach(ArchiveMember am; a.directory)
 				if( isPathFromZip(am.name) && (minPath == Path() || minPath.startsWith(Path(am.name))) )
 					minPath = Path(am.name);
-			
+
 			return minPath;
 		}
-		
+
 		logDebug("Installing from zip.");
-		
+
 		// In a github zip, the actual contents are in a subfolder
 		auto prefixInPackage = getPrefix(archive);
-		
+
 		Path getCleanedPath(string fileName) {
 			auto path = Path(fileName);
 			if(prefixInPackage != Path() && !path.startsWith(prefixInPackage)) return Path();
 			return path[prefixInPackage.length..path.length];
 		}
-		
+
 		// install
 		mkdirRecurse(to!string(destination));
 		Journal journal = new Journal;
 		foreach(ArchiveMember a; archive.directory) {
 			if(!isPathFromZip(a.name)) continue;
-			
+
 			auto cleanedPath = getCleanedPath(a.name);
 			if(cleanedPath.empty) continue;
 			auto fileName = to!string(destination~cleanedPath);
-			
+
 			if( exists(fileName) && isDir(fileName) ) continue;
-			
+
 			logDebug("Creating %s", fileName);
 			mkdirRecurse(fileName);
 			auto subPath = cleanedPath;
 			for(size_t i=0; i<subPath.length; ++i)
 				journal.add(Journal.Entry(Journal.Type.Directory, subPath[0..i+1]));
 		}
-		
+
 		foreach(ArchiveMember a; archive.directory) {
 			if(isPathFromZip(a.name)) continue;
 
 			auto cleanedPath = getCleanedPath(a.name);
 			if(cleanedPath.empty) continue;
-			
+
 			auto fileName = destination~cleanedPath;
-			
+
 			logDebug("Creating %s", fileName.head);
 			enforce(exists(to!string(fileName.parentPath)));
 			auto dstFile = openFile(to!string(fileName), FileMode.CreateTrunc);
@@ -576,26 +573,26 @@ class Vpm {
 			dstFile.write(archive.expand(a));
 			journal.add(Journal.Entry(Journal.Type.RegularFile, cleanedPath));
 		}
-		
+
 		// Write journal
 		logTrace("Saving installation journal...");
 		journal.add(Journal.Entry(Journal.Type.RegularFile, Path("journal.json")));
 		journal.save(destination ~ "journal.json");
-		
+
 		if(exists( to!string(destination~"package.json")))
 			logInfo(packageId ~ " has been installed with version %s", (new Package(destination)).vers);
 	}
-	
+
 	/// Uninstalls a given package from the list of installed modules.
 	/// @removeFromApplication: if true, this will also remove an entry in the
 	/// list of dependencies in the application's package.json
 	void uninstall(const string packageId, bool removeFromApplication = false) {
 		logInfo("Uninstalling " ~ packageId);
-		
+
 		auto journalFile = m_root~"modules"~packageId~"journal.json";
 		if( !exists(to!string(journalFile)) )
 			throw new Exception("Uninstall failed, no journal found for '"~packageId~"'. Please uninstall manually.");
-	
+
 		auto packagePath = m_root~"modules"~packageId;
 		auto journal = new Journal(journalFile);
 		logDebug("Erasing files");
@@ -606,10 +603,10 @@ class Vpm {
 				logWarn("Previously installed file not found for uninstalling: '%s'", absFile);
 				continue;
 			}
-			
+
 			remove(to!string(absFile));
 		}
-		
+
 		logDebug("Erasing directories");
 		Path[] allPaths;
 		foreach(Journal.Entry e; filter!((Journal.Entry a) => a.type == Journal.Type.Directory)(journal.entries))
@@ -623,10 +620,10 @@ class Vpm {
 			}
 			rmdir( to!string(p) );
 		}
-		
+
 		if(!isEmptyDir(packagePath))
 			throw new Exception("Alien files found in '"~to!string(packagePath)~"', manual uninstallation needed.");
-		
+
 		rmdir(to!string(packagePath));
 		logInfo("Uninstalled package: '"~packageId~"'");
 	}

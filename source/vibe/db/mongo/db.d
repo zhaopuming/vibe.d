@@ -29,7 +29,7 @@ class MongoDB {
 
 	package this(string host, ushort port = MongoConnection.defaultPort)
 	{
-		this("mongodb://" ~ host ~ ":" ~ to!string(port));
+		this("mongodb://" ~ host ~ ":" ~ to!string(port) ~ "/?safe=true");
 	}
 	
 	/**
@@ -52,6 +52,9 @@ class MongoDB {
 				ret.connect();
 				return ret;
 			});
+
+		// force a connection to cause an exception for wrong URLs
+		lockConnection();
 	}
 
 	/**
@@ -59,19 +62,19 @@ class MongoDB {
 
 		See_Also: $(LINK http://www.mongodb.org/display/DOCS/Commands)
 	*/
-	Bson runCommand(string db, Bson[string] command_and_options)
+	Bson runCommand(string db, Bson command_and_options)
 	{
 		return getCollection(db~".$cmd").findOne(command_and_options);
 	}
 
 	/// See $(LINK http://www.mongodb.org/display/DOCS/getLog+Command)
-	Bson getLog(string db, string mask){ return runCommand(db, ["getLog" : Bson(mask)]); }
+	Bson getLog(string db, string mask){ return runCommand(db, Bson(["getLog" : Bson(mask)])); }
 
 	/// See $(LINK http://www.mongodb.org/display/DOCS/fsync+Command)
-	Bson fsync(string db, bool async = false){ return runCommand(db, ["fsync" : Bson(1), "async" : Bson(async)]); }
+	Bson fsync(string db, bool async = false){ return runCommand(db, Bson(["fsync" : Bson(1), "async" : Bson(async)])); }
 
 	/// See $(LINK http://www.mongodb.org/display/DOCS/getLastError+Command) 
-	Bson getLastError(string db){ return runCommand(db, ["getlasterror" : Bson(1)]); }
+	Bson getLastError(string db){ return runCommand(db, Bson(["getlasterror" : Bson(1)])); }
 
 	/**
 		Accesses the collections inside this DB.

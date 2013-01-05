@@ -1,7 +1,6 @@
 HTTP
 ====
 
- - (partially done) add limits for header line length, body size, number of headers or request size and request time to avoid DoS
  - defer writing the header of server responses to the second written chunk in case of using bodyWriter() - if only one chunk is ever written, write non-chunked instead
  - implement generators for http.rest to generate a JavaScript client and "documentation" with all possible requests.
 
@@ -9,27 +8,27 @@ TCP
 ===
 
  - Find out what makes the libevent event loop continue to run after all connections have been disconnected
- - Add a DoS barrier that closes old connections in case of high connection counts
+ - Add a DoS barrier that closes old connections in case of high connection counts (e.g. Slowloris attack)
 
 GENERAL
 =======
 
- - Asynchronous file I/O
- - Load balancer with support for seemless recompile
+ - Asynchronous file I/O (already works for Win32)
+ - Load balancer with support for seemless recompile (vibedist)
  - Use the event_set_*_callback functions to log libevent messages
  - Analyze all code for memory leaks (e.g. SSLContext)
- - Add template arguments to API docs
  - HTTP server comparison to nginx
  - Mention the API used for Diet templates on the /templates page
  - Implement a soft-shutdown in case of catching an Error (in conjunction with vibedist)
  - Add support for an entry "lowerPriviledges" to package.json which will use the system's 'vibe' user for priviledge lowering
  - Document the different -version specifiers that are possible
- - Add code to generate a static version of vibed.org suitable for inclusion as docs in the download package
+ - See why find([""]) and find(Bson()) resets the connection and maybe detect their use before sending the command to the server
+ - Add proper documentation for types supported by the REST interface generator
 
 DIET TEMPLATES
 ==============
 
- - comments
+ - block comments
  - block default contents
  
 MARKDOWN FILTER
@@ -42,6 +41,5 @@ PACKAGE MANAGER
 ===============
 
  - allow the specification of optional dependencies (the user will just get a message that its possible to extend a package by installing the dependency)
- - implement "vibe init" to create a new vibe application skeleton ("vibe init" is in the current dir - warn if not empty!, and "vibe init xx" creates a new dir xx)
  - implement outputting of a generated vpm_versions.d module that contains the version of each installed package
  - package signing

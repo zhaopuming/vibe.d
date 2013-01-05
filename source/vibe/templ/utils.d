@@ -7,6 +7,10 @@
 */
 module vibe.templ.utils;
 
+import vibe.http.server;
+
+import std.traits;
+
 
 /**
 	Allows to pass additional variables to a function that renders a templated page.
@@ -32,13 +36,13 @@ module vibe.templ.utils;
 		{
 			string userinfo;
 			// TODO: fill userinfo with content, throw an Unauthorized HTTP error etc.
-			Next!(Vars, userinfo)(req, res);
+			Next!(Aliases, userinfo)(req, res);
 		}
 
 		void somethingInjector(alias Next, Aliases...)(HttpServerRequest req, HttpServerResponse res)
 		{
 			string something_else;
-			Next!(Vars, something_else)(req, res);
+			Next!(Aliases, something_else)(req, res);
 		}
 
 		void page(Aliases...)(HttpServerRequest req, HttpServerResponse res)
@@ -69,7 +73,7 @@ module vibe.templ.utils;
 		{
 			string userinfo;
 			// TODO: fill userinfo with content, throw an Unauthorized HTTP error etc.
-			Next!(Vars, userinfo)(req, res);
+			Next!(Aliases, userinfo)(req, res);
 		}
 
 		void somethingInjector(alias Next, Aliases...)(HttpServerRequest req, HttpServerResponse res)
@@ -83,7 +87,7 @@ module vibe.templ.utils;
 			if( params.userinfo == "peter" )
 				throw Exception("Not allowed!")
 
-			Next!(Vars)(req, res);
+			Next!(Aliases)(req, res);
 		}
 		---
 */
@@ -107,9 +111,20 @@ template localAliases(int i, ALIASES...)
 /// Variant[] args__ available that matches TYPES_AND_NAMES
 template localAliasesCompat(int i, TYPES_AND_NAMES...)
 {
+	import core.vararg;
 	static if( i+1 < TYPES_AND_NAMES.length ){
-		enum string localAliasesCompat = "auto "~TYPES_AND_NAMES[i+1]~" = *args__["~cttostring(i/2)~"].peek!(TYPES_AND_NAMES["~cttostring(i)~"])();\n"
-			~localAliasesCompat!(i+2, TYPES_AND_NAMES);
+		enum TYPE = "TYPES_AND_NAMES["~cttostring(i)~"]";
+		enum NAME = TYPES_AND_NAMES[i+1];
+		enum INDEX = cttostring(i/2);
+		enum string localAliasesCompat = 
+			TYPE~" "~NAME~";\n"~
+			"if( _arguments["~INDEX~"] == typeid(Variant) )\n"~
+			"\t"~NAME~" = *va_arg!Variant(_argptr).peek!("~TYPE~")();\n"~
+			"else {\n"~
+			"\tassert(_arguments["~INDEX~"] == typeid("~TYPE~"));\n"~
+			"\t"~NAME~" = va_arg!("~TYPE~")(_argptr);\n"~
+			"}\n"~
+			localAliasesCompat!(i+2, TYPES_AND_NAMES);
 	} else {
 		enum string localAliasesCompat = "";
 	}
@@ -120,11 +135,12 @@ package string cttostring(T)(T x)
 {
 	static if( is(T == string) ) return x;
 	else static if( is(T : long) || is(T : ulong) ){
+		Unqual!T tmp = x;
 		string s;
 		do {
-			s = cast(char)('0' + (x%10)) ~ s;
-			x /= 10;
-		} while (x>0);
+			s = cast(char)('0' + (tmp%10)) ~ s;
+			tmp /= 10;
+		} while(tmp > 0);
 		return s;
 	} else {
 		static assert(false, "Invalid type for cttostring: "~T.stringof);
@@ -140,7 +156,7 @@ private template injectReverse(Injectors...)
 }
 
 /// private
-private void reqInjector(alias Next, Vars...)(HttpServerRequest req, HttpServerResponse res)
+void reqInjector(alias Next, Vars...)(HttpServerRequest req, HttpServerResponse res)
 {
 	Next!(Vars, req)(req, res);
 }

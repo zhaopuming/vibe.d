@@ -8,7 +8,6 @@
 module vibe.core.drivers.libevent2_tcp;
 
 public import vibe.core.core;
-public import vibe.stream.stream;
 
 import vibe.core.log;
 import vibe.core.drivers.libevent2;
@@ -70,10 +69,10 @@ package class Libevent2TcpConnection : TcpConnection {
 		assert(Fiber.getThis() is m_ctx.task);
 
 		char buf[64];
-		if( ctx.remote_addr4.sin_family == AF_INET )
-			evutil_inet_ntop(AF_INET, &ctx.remote_addr4.sin_addr, buf.ptr, buf.length);
-		else
-			evutil_inet_ntop(AF_INET6, &ctx.remote_addr6.sin6_addr, buf.ptr, buf.length);
+		void* ptr;
+		if( ctx.remote_addr.family == AF_INET ) ptr = &ctx.remote_addr.sockAddrInet4.sin_addr;
+		else ptr = &ctx.remote_addr.sockAddrInet6.sin6_addr;
+		evutil_inet_ntop(ctx.remote_addr.family, ptr, buf.ptr, buf.length);
 		m_peerAddress = to!string(buf.ptr);
 	}
 	
@@ -144,7 +143,7 @@ package class Libevent2TcpConnection : TcpConnection {
 		version(Windows) shutdown(m_ctx.socketfd, SD_SEND);
 		else shutdown(m_ctx.socketfd, SHUT_WR);
 		if( m_ctx.event ) bufferevent_free(m_ctx.event);
-		TcpContext.Alloc.free(m_ctx);
+		TcpContextAlloc.free(m_ctx);
 		m_ctx = null;
 		logTrace("...socket %d closed.", fd);
 	}
@@ -220,7 +219,10 @@ package class Libevent2TcpConnection : TcpConnection {
 		logTrace("wait for data");
 		while( connected ) {
 			if( dataAvailableForRead || m_timeout_triggered ) break;
-			rawYield();
+			try rawYield();
+			catch( Exception e ){
+				logDebug("Connection error during waitForData: %s", e.toString());
+			}
 		}
 		logTrace(" -> timeout = %s", m_timeout_triggered);
 		return dataAvailableForRead;
@@ -265,11 +267,32 @@ package class Libevent2TcpConnection : TcpConnection {
 	{
 		enforce(m_ctx !is null, "Operating on closed TCPConnection.");
 		if( m_ctx.event is null ){
-			TcpContext.Alloc.free(m_ctx);
+			TcpContextAlloc.free(m_ctx);
 			m_ctx = null;
 			enforce(false, "Remote hung up while operating on TCPConnection.");
 		}
 		enforce(m_ctx.task is Fiber.getThis(), "Operating on TcpConnection owned by a different fiber!");
+	}
+}
+
+class LibeventTcpListener : TcpListener {
+	private {
+		TcpContext* m_ctx;
+	}
+
+	this(TcpContext* ctx)
+	{
+		m_ctx = ctx;
+	}
+
+	void stopListening()
+	{
+		if( !m_ctx ) return;
+
+		event_free(m_ctx.listenEvent);
+		evutil_closesocket(m_ctx.socketfd);
+		TcpContextAlloc.free(m_ctx);
+		m_ctx = null;
 	}
 }
 
@@ -280,20 +303,12 @@ package class Libevent2TcpConnection : TcpConnection {
 
 package struct TcpContext
 {
-	this(DriverCore c, event_base* evbase, int sock, bufferevent* evt, sockaddr_in6 peeraddr){
+	this(DriverCore c, event_base* evbase, int sock, bufferevent* evt, NetworkAddress peeraddr){
 		core = c;
 		eventLoop = evbase;
 		socketfd = sock;
 		event = evt;
-		remote_addr6 = peeraddr;
-	}
-
-	this(DriverCore c, event_base* evbase, int sock, bufferevent* evt, sockaddr_in peeraddr){
-		core = c;
-		eventLoop = evbase;
-		socketfd = sock;
-		event = evt;
-		remote_addr4 = peeraddr;
+		remote_addr = peeraddr;
 	}
 
 	this(DriverCore c, event_base* evbase, int sock, bufferevent* evt){
@@ -307,24 +322,21 @@ package struct TcpContext
 	event_base* eventLoop;
 	void delegate(TcpConnection conn) connectionCallback;
 	bufferevent* event;
-	union {
-		sockaddr_in6 remote_addr6;
-		sockaddr_in remote_addr4;
-	}
+	deimos.event2.event_struct.event* listenEvent;
+	NetworkAddress remote_addr;
 	bool shutdown = false;
 	int socketfd = -1;
 	int status = 0;
 	Task task;
-
-	alias FreeListObjectAlloc!(TcpContext, false, true) Alloc;
 }
+alias FreeListObjectAlloc!(TcpContext, false, true) TcpContextAlloc;
 
 
 /**************************************************************************************************/
 /* Private functions                                                                              */
 /**************************************************************************************************/
 
-package extern(C)
+package nothrow extern(C)
 {
 	void onConnect(evutil_socket_t listenfd, short evtype, void *arg)
 	{
@@ -338,7 +350,7 @@ package extern(C)
 
 		static struct ClientTask {
 			TcpContext* listen_ctx;
-			sockaddr_in6 remote_addr;
+			NetworkAddress remote_addr;
 			int sockfd;
 
 			void execute()
@@ -357,12 +369,12 @@ package extern(C)
 					return;
 				}
 
-				auto client_ctx = TcpContext.Alloc.alloc(drivercore, eventloop, sockfd, buf_event, remote_addr);
+				auto client_ctx = TcpContextAlloc.alloc(drivercore, eventloop, sockfd, buf_event, remote_addr);
 				assert(client_ctx.event !is null, "event is null although it was just != null?");
 				bufferevent_setcb(buf_event, &onSocketRead, &onSocketWrite, &onSocketEvent, client_ctx);
 				if( bufferevent_enable(buf_event, EV_READ|EV_WRITE) ){
 					bufferevent_free(buf_event);
-					TcpContext.Alloc.free(client_ctx);
+					TcpContextAlloc.free(client_ctx);
 					logError("Error enabling buffered I/O event for fd %d.", sockfd);
 					return;
 				}
@@ -386,36 +398,40 @@ package extern(C)
 			}
 		}
 
-		// Accept and configure incoming connections (up to 10 connections in one go)
-		foreach( i; 0 .. 10 ){
-			logTrace("accept");
-			assert(listenfd < int.max, "Listen socket descriptor >= int.max?!");
-			sockaddr_in6 remote_addr;
-			socklen_t addrlen = remote_addr.sizeof;
-			auto sockfd = accept(cast(int)listenfd, cast(sockaddr*)&remote_addr, &addrlen);
-			logTrace("accepted %d", sockfd);
-			if(sockfd < 0) {
-				version(Windows) auto err = evutil_socket_geterror(sockfd);
-				else auto err = errno;
-				if( err != EWOULDBLOCK && err != EAGAIN && err != 0 ){
-					version(Windows)
-						logError("Error accepting an incoming connection: %s", to!string(evutil_socket_error_to_string(err)));
-					else
-						logError("Error accepting an incoming connection: %d", err);
+		try {
+			// Accept and configure incoming connections (up to 10 connections in one go)
+			foreach( i; 0 .. 10 ){
+				logTrace("accept");
+				assert(listenfd < int.max, "Listen socket descriptor >= int.max?!");
+				sockaddr_in6 remote_addr;
+				socklen_t addrlen = remote_addr.sizeof;
+				auto sockfd = accept(cast(int)listenfd, cast(sockaddr*)&remote_addr, &addrlen);
+				logTrace("accepted %d", sockfd);
+				if(sockfd < 0) {
+					version(Windows) auto err = evutil_socket_geterror(sockfd);
+					else auto err = errno;
+					if( err != EWOULDBLOCK && err != EAGAIN && err != 0 ){
+						version(Windows)
+							logError("Error accepting an incoming connection: %s", to!string(evutil_socket_error_to_string(err)));
+						else
+							logError("Error accepting an incoming connection: %d", err);
+					}
+					break;
 				}
-				break;
-			}
 
-			auto task = FreeListObjectAlloc!ClientTask.alloc();
-			task.listen_ctx = ctx;
-			task.remote_addr = remote_addr;
-			task.sockfd = sockfd;
+				auto task = FreeListObjectAlloc!ClientTask.alloc();
+				task.listen_ctx = ctx;
+				*cast(sockaddr_in6*)task.remote_addr.sockAddr = remote_addr;
+				task.sockfd = sockfd;
 
-			version(MultiThreadTest){
-				runWorkerTask(&task.execute);
-			} else {
-				runTask(&task.execute);
+				version(MultiThreadTest){
+					runWorkerTask(&task.execute);
+				} else {
+					runTask(&task.execute);
+				}
 			}
+		} catch( Throwable e ){
+			logWarn("Got exception while accepting new connections: %s", e.msg);
 		}
 
 		logTrace("handled incoming connections...");
@@ -427,72 +443,88 @@ package extern(C)
 		logTrace("socket %d read event!", ctx.socketfd);
 
 		auto f = ctx.task;
-		if( f && f.state != Fiber.State.TERM )
-			ctx.core.resumeTask(f);
+		try {
+			if( f && f.state != Fiber.State.TERM )
+				ctx.core.resumeTask(f);
+		} catch( Throwable e ){
+			logWarn("Got exception when resuming task onSocketRead: %s", e.msg);
+		}
 	}
 
 	void onSocketWrite(bufferevent *buf_event, void *arg)
 	{
-		auto ctx = cast(TcpContext*)arg;
-		assert(ctx.event is buf_event, "Write event on bufferevent that does not match the TcpContext");
-		logTrace("socket %d write event (%s)!", ctx.socketfd, ctx.shutdown);
-		if( ctx.task && ctx.task.state != Fiber.State.TERM ){
-			bufferevent_flush(buf_event, EV_WRITE, bufferevent_flush_mode.BEV_FLUSH);
+		try {
+			auto ctx = cast(TcpContext*)arg;
+			assert(ctx.event is buf_event, "Write event on bufferevent that does not match the TcpContext");
+			logTrace("socket %d write event (%s)!", ctx.socketfd, ctx.shutdown);
+			if( ctx.task && ctx.task.state != Fiber.State.TERM ){
+				bufferevent_flush(buf_event, EV_WRITE, bufferevent_flush_mode.BEV_FLUSH);
+			}
+			if( ctx.task ) ctx.core.resumeTask(ctx.task);
+		} catch( Throwable e ){
+			logWarn("Got exception when resuming task onSocketRead: %s", e.msg);
 		}
-		if( ctx.task ) ctx.core.resumeTask(ctx.task);
 	}
 		
 	void onSocketEvent(bufferevent *buf_event, short status, void *arg)
 	{
-		auto ctx = cast(TcpContext*)arg;
-		ctx.status = status;
-		logDebug("Socket event on fd %d: %d (%s vs %s)", ctx.socketfd, status, cast(void*)buf_event, cast(void*)ctx.event);
-		assert(ctx.event is buf_event, "Status event on bufferevent that does not match the TcpContext");
-		
-		bool free_event = false;
-		
-		string errorMessage;
-		if( status & BEV_EVENT_EOF ){
-			logDebug("Connection was closed (fd %d).", ctx.socketfd);
-			free_event = true;
-		} else if( status & BEV_EVENT_TIMEOUT ){
-			logDebug("Remote host on fd %d timed out.", ctx.socketfd);
-			free_event = true;
-		} else if( status & BEV_EVENT_ERROR ){
-			version(Windows){
-				logDebug("A socket error occurred on fd %d: %d (%s)", ctx.socketfd, status, to!string(evutil_socket_error_to_string(status)));
-			} else {
-				logDebug("A socket error occurred on fd %d: %d", ctx.socketfd, status);
+		try {
+			auto ctx = cast(TcpContext*)arg;
+			ctx.status = status;
+			logDebug("Socket event on fd %d: %d (%s vs %s)", ctx.socketfd, status, cast(void*)buf_event, cast(void*)ctx.event);
+			assert(ctx.event is buf_event, "Status event on bufferevent that does not match the TcpContext");
+	
+			bool free_event = false;
+			
+			string errorMessage;
+			if( status & BEV_EVENT_EOF ){
+				logDebug("Connection was closed (fd %d).", ctx.socketfd);
+				free_event = true;
+			} else if( status & BEV_EVENT_TIMEOUT ){
+				logDebug("Remote host on fd %d timed out.", ctx.socketfd);
+				free_event = true;
+			} else if( status & BEV_EVENT_ERROR ){
+				version(Windows){
+					logDebug("A socket error occurred on fd %d: %d (%s)", ctx.socketfd, status, to!string(evutil_socket_error_to_string(status)));
+				} else {
+					logDebug("A socket error occurred on fd %d: %d", ctx.socketfd, status);
+				}
+				free_event = true;
+				if( status & BEV_EVENT_READING ) errorMessage = "Error reading data from socket. Remote hung up?";
+				else if( status & BEV_EVENT_WRITING ) errorMessage = "Error writing data to socket. Remote hung up?";
+				else errorMessage = "Socket error: "~to!string(status);
 			}
-			free_event = true;
-			if( status & BEV_EVENT_READING ) errorMessage = "Error reading data from socket. Remote hung up?";
-			else if( status & BEV_EVENT_WRITING ) errorMessage = "Error writing data to socket. Remote hung up?";
-			else errorMessage = "Socket error: "~to!string(status);
-		}
 
-		if( free_event || (status & BEV_EVENT_ERROR) ){	
-			bufferevent_free(buf_event);
-			ctx.event = null;
-		}
-
-		if( ctx.task && ctx.task.state != Fiber.State.TERM ){
-			if( status & BEV_EVENT_ERROR ){
-				logTrace("resuming corresponding task with exception...");
-				ctx.core.resumeTask(ctx.task, new Exception(errorMessage));
-			} else {
-				logTrace("resuming corresponding task...");
-				ctx.core.resumeTask(ctx.task);
+			if( free_event || (status & BEV_EVENT_ERROR) ){	
+				bufferevent_free(buf_event);
+				ctx.event = null;
 			}
+
+			if( ctx.task && ctx.task.state != Fiber.State.TERM ){
+				if( status & BEV_EVENT_ERROR ){
+					logTrace("resuming corresponding task with exception...");
+					ctx.core.resumeTask(ctx.task, new Exception(errorMessage));
+				} else {
+					logTrace("resuming corresponding task...");
+					ctx.core.resumeTask(ctx.task);
+				}
+			}
+		} catch( Throwable e ){
+			logWarn("Got exception when resuming task onSocketEvent: %s", e.msg);
 		}
 	}
 
 	private extern(C) void onTimeout(evutil_socket_t, short events, void* userptr)
 	{
-		logTrace("data wait timeout");
-		auto conn = cast(Libevent2TcpConnection)userptr;
-		conn.m_timeout_triggered = true;
-		if( conn.m_ctx ) conn.m_ctx.core.resumeTask(conn.m_ctx.task);
-		else logDebug("waitForData timeout after connection was closed!");
+		try {
+			logTrace("data wait timeout");
+			auto conn = cast(Libevent2TcpConnection)userptr;
+			conn.m_timeout_triggered = true;
+			if( conn.m_ctx ) conn.m_ctx.core.resumeTask(conn.m_ctx.task);
+			else logDebug("waitForData timeout after connection was closed!");
+		} catch( Throwable e ){
+			logWarn("Exception onTimeout: %s", e.msg);
+		}
 	}
 }
 

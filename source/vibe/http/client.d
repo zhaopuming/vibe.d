@@ -7,17 +7,18 @@
 */
 module vibe.http.client;
 
-public import vibe.core.tcp;
+public import vibe.core.net;
 public import vibe.http.common;
 
 import vibe.core.connectionpool;
 import vibe.core.core;
 import vibe.core.log;
 import vibe.data.json;
-import vibe.inet.rfc5322;
+import vibe.inet.message;
 import vibe.inet.url;
 import vibe.stream.counting;
 import vibe.stream.ssl;
+import vibe.stream.operations;
 import vibe.stream.zlib;
 
 import std.array;
@@ -174,16 +175,20 @@ class HttpClient : EventedObject {
 
 		// prepare body the reader
 		if( req.method == HttpMethod.HEAD ){
-			res.bodyReader = new LimitedInputStream(null, 0);
+			res.bodyReader = new LimitedInputStream(m_stream, 0);
 		} else {
 			if( auto pte = "Transfer-Encoding" in res.headers ){
 				enforce(*pte == "chunked");
 				res.bodyReader = new ChunkedInputStream(m_stream);
-			} else {
-				if( auto pcl = "Content-Length" in res.headers )
-					res.bodyReader = new LimitedInputStream(m_stream, to!ulong(*pcl));
-				else res.bodyReader = m_stream;
+			} else if( auto pcl = "Content-Length" in res.headers ){
+				res.bodyReader = new LimitedInputStream(m_stream, to!ulong(*pcl));
+			} else if( auto conn = "Connection" in res.headers ){
+				if( *conn == "close" ) res.bodyReader = m_stream;
+			} else if( res.httpVersion == HttpVersion.HTTP_1_0 ){
+				res.bodyReader = m_stream;
 			}
+			if( !res.bodyReader ) res.bodyReader = new LimitedInputStream(m_stream, 0);
+			
 			// TODO: handle content-encoding: deflate, gzip
 		}
 

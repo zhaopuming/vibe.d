@@ -24,7 +24,7 @@ If you don't have brew installed, install it according to their [install
 instructions](<https://github.com/mxcl/homebrew/wiki/installation>) and
 install libevent.
 
-    /usr/bin/ruby -e "$(curl -fsSL https://raw.github.com/mxcl/homebrew/master/Library/Contributions/install_homebrew.rb)"
+    ruby -e "$(curl -fsSkL raw.github.com/mxcl/homebrew/go)"
     brew install libevent
 
 (Note: Install brew only if you do not have macports, as they will conflict)
@@ -42,14 +42,15 @@ have to specify the path everytime:
 Installation on Linux (Debian/Ubuntu, using apt)
 ------------------------------------------------
 
-Go to https://code.google.com/p/d-apt/wiki/APT_Repository and follow the
+Go to <https://code.google.com/p/d-apt/wiki/APT_Repository> and follow the
 instructions. This will setup the APT repository of Jordi Sayol, who maintains
-a number of D packages for Debian.
+a number of D packages for Debian (*).
 
 Installing is then done using
 
     sudo apt-get install vibe
 
+(*) Note that Debian 6 (Squeeze) and older requires manual installation (see below).
 
 Installation on Linux (Debian/Ubuntu, manually)
 -----------------------------------------------
@@ -101,4 +102,26 @@ or
 
     su -c ln -s /path/to/vibe/bin/vibe /usr/bin/vibe
 
-(*) Note that some current linux distributions such as Debian squeeze or CentOS 6 may only ship libevent 1.4, in this case you will have to manually compile the latest 2.0.x version.
+(*) Note that some current linux distributions such as Debian squeeze or CentOS 6 may only ship libevent 1.4, in this case you will have to manually compile the latest 2.0.x version:
+
+```
+wget https://github.com/downloads/libevent/libevent/libevent-2.0.21-stable.tar.gz
+tar -xf libevent-2.0.21-stable.tar.gz
+cd libevent-2.0.21-stable
+./configure
+make
+make install
+ldconfig
+```
+
+
+Installation on FreeBSD
+-----------------------
+
+Install vibe dependencies by using portupgrade or similar like that
+
+    sudo portupgrade -PN devel/libevent2 devel/pkgconf
+
+Run setup-freebsd.sh
+
+    sudo setup-freebsd.sh

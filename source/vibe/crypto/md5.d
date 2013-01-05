@@ -7,14 +7,26 @@
 */
 module vibe.crypto.md5;
 
-import std.md5;
+static if( __traits(compiles, {import std.digest.md;}) ){
+	import std.digest.md;
 
-string md5(in char[] str) 
-{
-	ubyte[16] digest;
-	MD5_CTX ctx;
-	ctx.start();
-	ctx.update(str);
-	ctx.finish(digest);
-	return digestToString(digest);
+	string md5(in char[] str) 
+	{
+		MD5 ctx;
+		ctx.start();
+		ctx.put(cast(ubyte[])str);
+		return ctx.finish().toHexString();
+	}
+} else {
+	import std.md5;
+
+	string md5(in char[] str) 
+	{
+		ubyte[16] digest;
+		MD5_CTX ctx;
+		ctx.start();
+		ctx.update(str);
+		ctx.finish(digest);
+		return digestToString(digest);
+	}
 }

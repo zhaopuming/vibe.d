@@ -1,8 +1,9 @@
 module vibe.db.redis.redis;
 
-public import vibe.core.tcp;
+public import vibe.core.net;
 
 import vibe.core.log;
+import vibe.stream.operations;
 import std.string;
 import std.conv;
 import std.exception;
@@ -33,7 +34,6 @@ final class RedisReply {
 				break;
 			case '-':
 				throw new Exception(ln[ 1 .. $ ]);
-				break;			
 			case ':':
 				m_data = cast(ubyte[])ln[ 1 .. $ ];
 				break;
@@ -104,7 +104,7 @@ final class RedisClient {
 		        static assert(i % 2 != 1 || isArray!T, "Values must be arrays.");
 		    }
 		    ubyte[][] ret;
-		    foreach( i, arg; args) list ~= cast(ubyte[])arg;
+		    foreach( i, arg; args) ret ~= cast(ubyte[])arg;
 		    return ret;
 		}
 	}
@@ -152,8 +152,8 @@ final class RedisClient {
 
 	//TODO sort
 
-	size_t ttl(string key) {
-		return request!size_t("TTL", cast(ubyte[])key);
+	long ttl(string key) {
+		return request!long("TTL", cast(ubyte[])key);
 	}
 
 	string type(string key) {
@@ -433,7 +433,18 @@ final class RedisClient {
 		return request("ZRANGE", args);
 	}
 
-	//TODO: zrangeByScore
+	RedisReply zrangeByScore(string key, size_t start, size_t end, bool withScores=false) {
+		ubyte[][] args = [cast(ubyte[])key, cast(ubyte[])to!string(start), cast(ubyte[])to!string(end)];
+		if (withScores) args ~= cast(ubyte[])"WITHSCORES";
+		return request("ZRANGEBYSCORE", args);
+	}
+
+	RedisReply zrangeByScore(string key, size_t start, size_t end, size_t offset, size_t count, bool withScores=false) {
+		ubyte[][] args = [cast(ubyte[])key, cast(ubyte[])to!string(start), cast(ubyte[])to!string(end)];
+		if (withScores) args ~= cast(ubyte[])"WITHSCORES";
+                args ~= cast(ubyte[])"LIMIT" ~ cast(ubyte[])to!string(offset) ~ cast(ubyte[])to!string(count);
+		return request("ZRANGEBYSCORE", args);
+	}
 
 	int zrank(string key, string member) {
 		auto str = request!string("ZRANK", cast(ubyte[]) key, cast(ubyte[]) member);
@@ -448,7 +459,7 @@ final class RedisClient {
 		return request!size_t("ZREMRANGEBYRANK", cast(ubyte[])key, cast(ubyte[])to!string(start), cast(ubyte[])to!string(stop));
 	}
 
-	size_t zremRangeByScore(string key,	double min, double max) {
+	size_t zremRangeByScore(string key, double min, double max) {
 		return request!size_t("ZREMRANGEBYSCORE", cast(ubyte[])key, cast(ubyte[])to!string(min), cast(ubyte[])to!string(max));
 	}	
 

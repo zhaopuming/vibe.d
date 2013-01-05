@@ -7,11 +7,42 @@
 */
 module vibe.core.driver;
 
-public import vibe.stream.stream;
+public import vibe.core.file;
+public import vibe.core.net;
+public import vibe.core.signal;
+public import vibe.core.stream;
+public import vibe.core.task;
 
 import vibe.inet.url;
 
-import core.thread;
+import core.time;
+import std.exception;
+
+
+/**
+	Returns the active event driver
+*/
+EventDriver getEventDriver()
+{
+	return s_driver;
+}
+
+/// private
+package void setEventDriver(EventDriver driver)
+{
+	s_driver = driver;
+}
+
+package void deleteEventDriver()
+{
+	// TODO: use destroy() instead
+	delete s_driver;
+}
+
+
+private {
+	EventDriver s_driver;
+}
 
 
 /**
@@ -39,7 +70,15 @@ interface EventDriver {
 
 	/** Opens a file on disk with the speficied file mode.
 	*/
-	FileStream openFile(string path, FileMode mode);
+	FileStream openFile(Path path, FileMode mode);
+
+	/** Starts watching a directory for changes.
+	*/
+	DirectoryWatcher watchDirectory(Path path, bool recursive);
+
+	/** Resolves the given host name or IP address string.
+	*/
+	NetworkAddress resolveHost(string host, ushort family, bool no_dns);
 
 	/** Establiches a tcp connection on the specified host/port.
 
@@ -50,9 +89,17 @@ interface EventDriver {
 	/** Listens on the specified port and interface for TCP connections.
 
 		'bind_address' must be an IPv4 or IPv6 address string corresponding to a local network
-		interface.
+		interface. conn_callback is called for every incoming connection, each time from a
+		new task.
 	*/
-	void listenTcp(ushort port, void delegate(TcpConnection conn) conn_callback, string bind_address);
+	TcpListener listenTcp(ushort port, void delegate(TcpConnection conn) conn_callback, string bind_address);
+
+	/** Creates a new UDP socket and sets the specified address/port as the destination for packets.
+
+		If a bind port is specified, the socket will be able to receive UDP packets on that port.
+		Otherwise, a random bind port is chosen.
+	*/
+	UdpConnection listenUdp(ushort port, string bind_address = "0.0.0.0");
 
 	/** Creates a new signal (a single-threaded condition variable).
 	*/
@@ -65,6 +112,7 @@ interface EventDriver {
 	Timer createTimer(void delegate() callback);
 }
 
+
 /**
 	Provides an event driver with core functions for task/fiber control.
 */
@@ -72,15 +120,6 @@ interface DriverCore {
 	void yieldForEvent();
 	void resumeTask(Task f, Exception event_exception = null);
 	void notifyIdle();
-}
-
-class Task : Fiber {
-	protected this(void delegate() fun, size_t stack_size)
-	{
-		super(fun);
-	}
-
-	static Task getThis(){ return cast(Task)Fiber.getThis(); }
 }
 
 
@@ -103,87 +142,23 @@ interface EventedObject {
 	bool isOwner();
 }
 
-/**
-	Represents a single TCP connection.
-*/
-interface TcpConnection : Stream, EventedObject {
-	/// Used to disable Nagle's algorithm
-	@property void tcpNoDelay(bool enabled);
-	/// ditto
-	@property bool tcpNoDelay() const;
-
-	/// Controls the read time out after which the connection is closed automatically
-	@property void readTimeout(Duration duration)
-		in { assert(duration >= dur!"seconds"(0)); }
-	/// ditto
-	@property Duration readTimeout() const;
-
-	/// Actively closes the connection.
-	void close();
-
-	/// The current connection status
-	@property bool connected() const;
-
-	/// Returns the IP address of the connected peer.
-	@property string peerAddress() const;
-
-	/// Sets a timeout until data has to be availabe for read. Returns false on timeout.
-	bool waitForData(Duration timeout);
-}
 
 /**
-	Specifies how a file is manipulated on disk.
-*/
-enum FileMode {
-	Read,
-	ReadWrite,
-	CreateTrunc,
-	Append
-}
-
-/**
-	Accesses the contents of a file as a stream.
-*/
-interface FileStream : Stream, EventedObject {
-	/// The path of the file.
-	@property Path path() const;
-
-	/// Returns the total size of the file.
-	@property ulong size() const;
-
-	/// Determines if this stream is readable.
-	@property bool readable() const;
-
-	/// Determines if this stream is writable.
-	@property bool writable() const;
-
-	/// Closes the file handle.
-	void close();
-
-	/// Seeks to a specific position in the file if supported by the stream.
-	void seek(ulong offset);
-
-	/// Returns the current offset of the file pointer
-	ulong tell();
-}
-
-/** A cross-fiber signal
-
-	Note: the ownership can be shared between multiple fibers.
-*/
-interface Signal : EventedObject {
-	@property int emitCount() const;
-	void emit();
-	void wait();
-	void wait(int reference_emit_count);
-}
-
-/**
+	Represents a timer.
 */
 interface Timer : EventedObject {
+	/// True if the timer is yet to fire.
 	@property bool pending();
 
+	/** Resets the timer to the specified timeout
+	*/
 	void rearm(Duration dur, bool periodic = false);
+
+	/** Resets the timer and avoids any firing.
+	*/
 	void stop();
+
+	/** Waits until the timer fires.
+	*/
 	void wait();
 }

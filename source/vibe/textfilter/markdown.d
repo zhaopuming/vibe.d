@@ -37,21 +37,35 @@ version(MarkdownTest)
 	}
 }
 
-string filterMarkdown()(string str)
+/** Returns a Markdown filtered HTML string.
+*/
+string filterMarkdown()(string str, MarkdownFlags flags = MarkdownFlags.vanillaMarkdown)
 {
 	auto dst = appender!string();
-	filterMarkdown(dst, str);
+	filterMarkdown(dst, str, flags);
 	return dst.data;
 }
 
-void filterMarkdown(R)(ref R dst, string src)
+
+/** Markdown filters the given string and writes the corresponding HTML to an output range.
+*/
+void filterMarkdown(R)(ref R dst, string src, MarkdownFlags flags = MarkdownFlags.vanillaMarkdown)
 {
 	auto all_lines = splitLines(src);
 	auto links = scanForReferences(all_lines);
-	auto lines = parseLines(all_lines);
+	auto lines = parseLines(all_lines, flags);
 	Block root_block;
-	parseBlocks(root_block, lines, null);
-	writeBlock(dst, root_block, links);
+	parseBlocks(root_block, lines, null, flags);
+	writeBlock(dst, root_block, links, flags);
+}
+
+enum MarkdownFlags {
+	none = 0,
+	keepLineBreaks = 1<<0,
+	backtickCodeBlocks = 1<<1,
+	noInlineHtml = 1<<2,
+	vanillaMarkdown = none,
+	forumDefault = keepLineBreaks|backtickCodeBlocks|noInlineHtml
 }
 
 private {
@@ -72,7 +86,8 @@ private enum LineType {
 	SetextHeader,
 	UList,
 	OList,
-	HtmlBlock
+	HtmlBlock,
+	CodeBlockDelimiter
 }
 
 private struct Line {
@@ -100,7 +115,7 @@ private struct Line {
 	}
 }
 
-private Line[] parseLines(ref string[] lines)
+private Line[] parseLines(ref string[] lines, MarkdownFlags flags)
 {
 	Line[] ret;
 	while( !lines.empty ){
@@ -127,13 +142,14 @@ private Line[] parseLines(ref string[] lines)
 		}
 		lninfo.unindented = ln;
 
-		if( isAtxHeaderLine(ln) ) lninfo.type = LineType.AtxHeader;
+		if( (flags & MarkdownFlags.backtickCodeBlocks) && isCodeBlockDelimiter(ln) ) lninfo.type = LineType.CodeBlockDelimiter;
+		else if( isAtxHeaderLine(ln) ) lninfo.type = LineType.AtxHeader;
 		else if( isSetextHeaderLine(ln) ) lninfo.type = LineType.SetextHeader;
 		else if( isOListLine(ln) ) lninfo.type = LineType.OList;
 		else if( isUListLine(ln) ) lninfo.type = LineType.UList;
 		else if( isHlineLine(ln) ) lninfo.type = LineType.Hline;
 		else if( isLineBlank(ln) ) lninfo.type = LineType.Blank;
-		else if( isHtmlBlockLine(ln) ) lninfo.type = LineType.HtmlBlock;
+		else if( !(flags & MarkdownFlags.noInlineHtml) && isHtmlBlockLine(ln) ) lninfo.type = LineType.HtmlBlock;
 		else lninfo.type = LineType.Plain;
 
 		ret ~= lninfo;
@@ -160,7 +176,7 @@ private struct Block {
 	size_t headerLevel;
 }
 
-private void parseBlocks(ref Block root, ref Line[] lines, IndentType[] base_indent)
+private void parseBlocks(ref Block root, ref Line[] lines, IndentType[] base_indent, MarkdownFlags flags)
 {
 	if( base_indent.length == 0 ) root.type = BlockType.Text;
 	else if( base_indent[$-1] == IndentType.Quote ) root.type = BlockType.Quote;
@@ -190,7 +206,7 @@ private void parseBlocks(ref Block root, ref Line[] lines, IndentType[] base_ind
 				root.blocks ~= cblock;
 			} else {
 				Block subblock;
-				parseBlocks(subblock, lines, ln.indent[0 .. base_indent.length+1]);
+				parseBlocks(subblock, lines, ln.indent[0 .. base_indent.length+1], flags);
 				root.blocks ~= subblock;
 			}
 		} else {
@@ -228,7 +244,9 @@ private void parseBlocks(ref Block root, ref Line[] lines, IndentType[] base_ind
 					b.text = [hl];
 					lines.popFront();
 					break;
-				case LineType.SetextHeader: assert(false);
+				case LineType.SetextHeader:
+					lines.popFront();
+					break;
 				case LineType.UList:
 				case LineType.OList:
 					b.type = ln.type == LineType.UList ? BlockType.UList : BlockType.OList;
@@ -251,7 +269,7 @@ private void parseBlocks(ref Block root, ref Line[] lines, IndentType[] base_ind
 							itm.text = null;
 						}
 
-						parseBlocks(itm, lines, itemindent);
+						parseBlocks(itm, lines, itemindent, flags);
 						itm.type = BlockType.ListItem;
 						b.blocks ~= itm;
 					}
@@ -274,6 +292,20 @@ private void parseBlocks(ref Block root, ref Line[] lines, IndentType[] base_ind
 						if( taginfo.isHtmlBlock && taginfo.tagName == starttag.tagName )
 							nestlevel += taginfo.open ? 1 : -1;
 						if( nestlevel <= 0 ) break;
+					}
+					break;
+				case LineType.CodeBlockDelimiter:
+					lines.popFront(); // TODO: get language from line
+					b.type = BlockType.Code;
+					while(!lines.empty){
+						if( lines.front.indent.length < base_indent.length ) break;
+						if( lines.front.indent[0 .. base_indent.length] != base_indent ) break;
+						if( lines.front.type == LineType.CodeBlockDelimiter ){
+							lines.popFront();
+							break;
+						}
+						b.text ~= lines.front.unindent(base_indent.length);
+						lines.popFront();
 					}
 					break;
 			}
@@ -307,7 +339,8 @@ private string[] skipText(ref Line[] lines, IndentType[] indent)
 	}
 }
 
-private void writeBlock(R)(ref R dst, ref const Block block, LinkRef[string] links)
+/// private
+private void writeBlock(R)(ref R dst, ref const Block block, LinkRef[string] links, MarkdownFlags flags)
 {
 	final switch(block.type){
 		case BlockType.Plain:
@@ -316,21 +349,23 @@ private void writeBlock(R)(ref R dst, ref const Block block, LinkRef[string] lin
 				dst.put("\n");
 			}
 			foreach(b; block.blocks)
-				writeBlock(dst, b, links);
+				writeBlock(dst, b, links, flags);
 			break;
 		case BlockType.Text:
 			foreach( ln; block.text ){
-				writeMarkdownEscaped(dst, ln, links);
+				writeMarkdownEscaped(dst, ln, links, flags);
+				if( flags & MarkdownFlags.keepLineBreaks ) dst.put("<br>");
 				dst.put("\n");
 			}
 			foreach(b; block.blocks)
-				writeBlock(dst, b, links);
+				writeBlock(dst, b, links, flags);
 			break;
 		case BlockType.Paragraph:
 			assert(block.blocks.length == 0);
 			dst.put("<p>");
 			foreach( ln; block.text ){
-				writeMarkdownEscaped(dst, ln, links);
+				writeMarkdownEscaped(dst, ln, links, flags);
+				if( flags & MarkdownFlags.keepLineBreaks ) dst.put("<br>");
 				dst.put("\n");
 			}
 			dst.put("</p>\n");
@@ -342,7 +377,7 @@ private void writeBlock(R)(ref R dst, ref const Block block, LinkRef[string] lin
 			dst.put(nstr);
 			dst.put(">");
 			assert(block.text.length == 1);
-			writeMarkdownEscaped(dst, block.text[0], links);
+			writeMarkdownEscaped(dst, block.text[0], links, flags);
 			dst.put("</h");
 			dst.put(nstr);
 			dst.put(">\n");
@@ -350,48 +385,51 @@ private void writeBlock(R)(ref R dst, ref const Block block, LinkRef[string] lin
 		case BlockType.OList:
 			dst.put("<ol>\n");
 			foreach(b; block.blocks)
-				writeBlock(dst, b, links);
+				writeBlock(dst, b, links, flags);
 			dst.put("</ol>\n");
 			break;
 		case BlockType.UList:
 			dst.put("<ul>\n");
 			foreach(b; block.blocks)
-				writeBlock(dst, b, links);
+				writeBlock(dst, b, links, flags);
 			dst.put("</ul>\n");
 			break;
 		case BlockType.ListItem:
 			dst.put("<li>");
 			foreach(ln; block.text){
-				writeMarkdownEscaped(dst, ln, links);
+				writeMarkdownEscaped(dst, ln, links, flags);
+				if( flags & MarkdownFlags.keepLineBreaks ) dst.put("<br>");
 				dst.put("\n");
 			}
 			foreach(b; block.blocks)
-				writeBlock(dst, b, links);
+				writeBlock(dst, b, links, flags);
 			dst.put("</li>\n");
 			break;
 		case BlockType.Code:
 			assert(block.blocks.length == 0);
-			dst.put("<code><pre>");
+			dst.put("<pre class=\"prettyprint\"><code>");
 			foreach(ln; block.text){
 				filterHtmlEscape(dst, ln);
 				dst.put("\n");
 			}
-			dst.put("</pre></code>");
+			dst.put("</code></pre>");
 			break;
 		case BlockType.Quote:
-			dst.put("<quot>");
+			dst.put("<blockquote>");
 			foreach(ln; block.text){
-				writeMarkdownEscaped(dst, ln, links);
+				writeMarkdownEscaped(dst, ln, links, flags);
+				if( flags & MarkdownFlags.keepLineBreaks ) dst.put("<br>");
 				dst.put("\n");
 			}
 			foreach(b; block.blocks)
-				writeBlock(dst, b, links);
-			dst.put("</quot>\n");
+				writeBlock(dst, b, links, flags);
+			dst.put("</blockquote>\n");
 			break;
 	}
 }
 
-private void writeMarkdownEscaped(R)(ref R dst, string ln, in LinkRef[string] linkrefs)
+/// private
+private void writeMarkdownEscaped(R)(ref R dst, string ln, in LinkRef[string] linkrefs, MarkdownFlags flags)
 {
 	bool br = ln.endsWith("  ");
 	while( ln.length > 0 ){
@@ -433,7 +471,7 @@ private void writeMarkdownEscaped(R)(ref R dst, string ln, in LinkRef[string] li
 			case '`':
 				string code;
 				if( parseInlineCode(ln, code) ){
-					dst.put("<code>");
+					dst.put("<code class=\"prettyprint\">");
 					filterHtmlEscape(dst, code);
 					dst.put("</code>");
 				} else {
@@ -483,6 +521,11 @@ private void writeMarkdownEscaped(R)(ref R dst, string ln, in LinkRef[string] li
 					ln = ln[1 .. $];
 				}
 				break;
+			case '>':
+				if( flags & MarkdownFlags.noInlineHtml ) dst.put("&gt;");
+				else dst.put(ln[0]);
+				ln = ln[1 .. $];
+				break;
 			case '<':
 				string url;
 				if( parseAutoLink(ln, url) ){
@@ -495,15 +538,17 @@ private void writeMarkdownEscaped(R)(ref R dst, string ln, in LinkRef[string] li
 					else filterHtmlEscape(dst, url);
 					dst.put("</a>");
 				} else {
-					dst.put(ln[0]);
+					if( flags & MarkdownFlags.noInlineHtml ) dst.put("&lt;");
+					else dst.put(ln[0]);
 					ln = ln[1 .. $];
 				}
 				break;
 		}
 	}
-	if( br ) dst.put("<br>");
+	if( br ) dst.put("<br/>");
 }
 
+/// private
 private void outputHeaderLine(R)(ref R dst, string ln, string hln)
 {
 	hln = stripLeft(hln);
@@ -529,16 +574,6 @@ private void outputHeaderLine(R)(ref R dst, string ln, string hln)
 	dst.put(">\n");
 }
 
-private void enterBlockQuote(R)(ref R dst)
-{
-	dst.put("<blockquote>");
-}
-
-private void exitBlockQuote(R)(ref R dst)
-{
-	dst.put("</blockquote>");
-}
-
 private bool isLineBlank(string ln)
 {
 	return allOf(ln, " \t");
@@ -556,7 +591,10 @@ private bool isSetextHeaderLine(string ln)
 private bool isAtxHeaderLine(string ln)
 {
 	ln = stripLeft(ln);
-	return ln.startsWith("#");
+	size_t i = 0;
+	while( i < ln.length && ln[i] == '#' ) i++;
+	if( i < 1 || i > 6 || i >= ln.length ) return false;
+	return ln[i] == ' ';
 }
 
 private bool isHlineLine(string ln)
@@ -585,8 +623,10 @@ private size_t getQuoteLevel(string ln)
 private bool isUListLine(string ln)
 {
 	ln = stripLeft(ln);
-	if( ln.length < 1 ) return false;
-	return "*+-".countUntil(ln[0]) >= 0;
+	if( ln.length < 2 ) return false;
+	if( "*+-".countUntil(ln[0]) < 0 ) return false;
+	if( ln[1] != ' ' && ln[1] != '\t' ) return false;
+	return true;
 }
 
 private bool isOListLine(string ln)
@@ -618,7 +658,7 @@ private string removeListPrefix(string str, LineType tp)
 }
 
 
-auto parseHtmlBlockLine(string ln)
+private auto parseHtmlBlockLine(string ln)
 {
 	struct HtmlBlockInfo {
 		bool isHtmlBlock;
@@ -655,19 +695,24 @@ auto parseHtmlBlockLine(string ln)
 	return ret;
 }
 
-bool isHtmlBlockLine(string ln)
+private bool isHtmlBlockLine(string ln)
 {
 	auto bi = parseHtmlBlockLine(ln);
 	return bi.isHtmlBlock && bi.open;
 }
 
-bool isHtmlBlockCloseLine(string ln)
+private bool isHtmlBlockCloseLine(string ln)
 {
 	auto bi = parseHtmlBlockLine(ln);
 	return bi.isHtmlBlock && !bi.open;
 }
 
-string getHtmlTagName(string ln)
+private bool isCodeBlockDelimiter(string ln)
+{
+	return ln.startsWith("```");
+}
+
+private string getHtmlTagName(string ln)
 {
 	return parseHtmlBlockLine(ln).tagName;
 }
@@ -786,7 +831,7 @@ private bool parseLink(ref string str, ref Link dst, in LinkRef[string] linkrefs
 	return true;
 }
 
-bool parseAutoLink(ref string str, ref string url)
+private bool parseAutoLink(ref string str, ref string url)
 {
 	string pstr = str;
 	if( pstr.length < 3 ) return false;
@@ -796,6 +841,7 @@ bool parseAutoLink(ref string str, ref string url)
 	if( cidx < 0 ) return false;
 	url = pstr[0 .. cidx];
 	if( anyOf(url, " \t") ) return false;
+	if( !anyOf(url, ":@") ) return false;
 	str = pstr[cidx+1 .. $];
 	if( url.countUntil('@') > 0 ) url = "mailto:"~url;
 	return true;
